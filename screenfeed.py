@@ -933,7 +933,7 @@ def run_app() -> None:
         if getattr(b, "sf_key", None) == key:
             return
         b.sf_key = key
-        b.setEnabled_(enabled)
+        b.sf_enabled = enabled  # not setEnabled_: AppKit would fade the icon a second time
         b.layer().setBackgroundColor_(bg.CGColor())
         para = K.NSMutableParagraphStyle.alloc().init()
         para.setAlignment_(K.NSTextAlignmentCenter)
@@ -1104,9 +1104,13 @@ def run_app() -> None:
 
         # -- actions ---------------------------------------------------------------------------
         def onRec_(self, sender):
+            if not getattr(sender, "sf_enabled", True):
+                return
             threading.Thread(target=ctl.toggle, daemon=True).start()
 
         def onSend_(self, sender):
+            if not getattr(sender, "sf_enabled", True):
+                return
             threading.Thread(target=ctl.send, kwargs={"manual": True}, daemon=True).start()
 
         def onAuto_(self, sender):
@@ -1128,6 +1132,8 @@ def run_app() -> None:
             AppHelper.callAfter(shutdown)
 
         def onDiscard_(self, sender):
+            if not getattr(sender, "sf_enabled", True):
+                return
             threading.Thread(target=ctl.discard, daemon=True).start()
 
         # -- refresh ---------------------------------------------------------------------------
@@ -1183,9 +1189,10 @@ def run_app() -> None:
             red = K.NSColor.systemRedColor()
             blue = K.NSColor.systemBlueColor()
             white = K.NSColor.whiteColor()
-            dim_bg = K.NSColor.colorWithWhite_alpha_(1.0, 0.07)
-            dim_fg = K.NSColor.colorWithWhite_alpha_(1.0, 0.35)
-            neutral_bg = K.NSColor.colorWithWhite_alpha_(1.0, 0.16)
+            # solid backgrounds: contrast stays the same whatever is behind the translucent panel
+            dim_bg = K.NSColor.colorWithWhite_alpha_(0.22, 0.92)
+            dim_fg = K.NSColor.colorWithWhite_alpha_(0.70, 1.0)
+            neutral_bg = K.NSColor.colorWithWhite_alpha_(0.36, 0.95)
             can_rec = bool(rec or ctl.screen)
             if rec:
                 style_button(self.rec, "Pause", "pause.fill", neutral_bg, white, True)
