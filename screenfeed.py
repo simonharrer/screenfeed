@@ -61,6 +61,26 @@ FPS = int(os.environ.get("SCREENFEED_FPS", "5"))
 KEEP_VIDEO = os.environ.get("SCREENFEED_KEEP_VIDEO") == "1"
 MAX_MOMENTS = int(os.environ.get("SCREENFEED_MAX_MOMENTS", "24"))
 FFMPEG = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+
+
+def build_info() -> str:
+    """When the running code was built: script mtime, plus git commit (+ if uncommitted changes)."""
+    src = Path(os.path.realpath(__file__))
+    stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(src.stat().st_mtime))
+    try:
+        git = ["git", "-C", str(src.parent)]
+        rev = subprocess.run(git + ["rev-parse", "--short", "HEAD"], capture_output=True,
+                             text=True, timeout=3).stdout.strip()
+        dirty = subprocess.run(git + ["status", "--porcelain", "--", src.name], capture_output=True,
+                               text=True, timeout=3).stdout.strip()
+        if rev:
+            return f"build {stamp} · {rev}{'+' if dirty else ''}"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return f"build {stamp}"
+
+
+BUILD = build_info()
 FFPROBE = shutil.which("ffprobe") or "/opt/homebrew/bin/ffprobe"
 WHISPER = shutil.which("whisper-cli") or "/opt/homebrew/bin/whisper-cli"
 AUTO_STEPS = [0, 30, 60, 120, 300]
@@ -460,6 +480,7 @@ class Controller:
             "status": self.status,
             "claude_msg": self.claude_msg,
             "last_batch": self.last_batch,
+            "build": BUILD,
             "history": [dict(h, sent_at=time.strftime("%H:%M:%S", time.localtime(h["sent_at"])))
                         for h in self.history],
         }
@@ -944,6 +965,10 @@ def run_app() -> None:
             self.msg = label(12, 88, W - 24, 11, K.NSColor.systemTealColor())
             hh = label(12, 68, W - 24, 10, K.NSColor.tertiaryLabelColor(), bold=True, h=14)
             hh.setStringValue_("SENT")
+            bl = label(12, 68, W - 24, 10, K.NSColor.tertiaryLabelColor(), mono=True, h=14)
+            bl.setAlignment_(K.NSTextAlignmentRight)
+            bl.setStringValue_(BUILD)
+            bl.setToolTip_("When the running version of screenfeed.py was built (file time · git commit, + = uncommitted changes)")
             self.hist = [label(12, 54 - 14 * i, W - 24, 10.5, K.NSColor.secondaryLabelColor(),
                                mono=True, h=14) for i in range(4)]
             self.panel = p
