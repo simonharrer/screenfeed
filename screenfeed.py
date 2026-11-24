@@ -797,7 +797,7 @@ def run_app() -> None:
         name = str(s.localizedName())
         return {"id": did, "index": ids.index(did) if did in ids else 0,
                 "frame": (f.origin.x, f.origin.y, f.size.width, f.size.height),
-                "name": name, "label": f"{name} ({int(f.size.width)}×{int(f.size.height)})"}
+                "name": name, "label": name, "size": f"{int(f.size.width)}×{int(f.size.height)}"}
 
     def all_screens() -> list[dict]:
         infos = [screen_info(s) for s in K.NSScreen.screens()]
@@ -917,9 +917,20 @@ def run_app() -> None:
         def acceptsFirstMouse_(self, ev):
             return True
 
+    def symbol(name: str, size: float = 15, weight: float = 0.0):
+        img = K.NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
+        if img is None:
+            return None
+        cfg = K.NSImageSymbolConfiguration.configurationWithPointSize_weight_(size, weight)
+        return img.imageWithSymbolConfiguration_(cfg)
+
+    AUTO_TITLES = {0: "Auto-send off", 30: "Every 30 s", 60: "Every minute", 120: "Every 2 min",
+                   300: "Every 5 min"}
+
     class ScreenfeedUI(K.NSObject):
         def build(self):
-            W, H = 392, 214
+            W, H = 340, 258
+            self.W, self.H = W, H
             vf = K.NSScreen.mainScreen().visibleFrame()
             rect = K.NSMakeRect(vf.origin.x + vf.size.width - W - 24, vf.origin.y + 24, W, H)
             p = ScreenfeedPanel.alloc().initWithContentRect_styleMask_backing_defer_(
@@ -940,23 +951,18 @@ def run_app() -> None:
             v.setBlendingMode_(K.NSVisualEffectBlendingModeBehindWindow)
             v.setState_(K.NSVisualEffectStateActive)
             v.setWantsLayer_(True)
-            v.layer().setCornerRadius_(12)
+            v.layer().setCornerRadius_(16)
             v.layer().setMasksToBounds_(True)
+            v.layer().setBorderColor_(K.NSColor.systemRedColor().CGColor())
             p.setContentView_(v)
+            self.panel, self.view = p, v
 
-            def button(x, w, title, action):
-                b = ScreenfeedButton.alloc().initWithFrame_(K.NSMakeRect(x, H - 34, w, 28))
-                b.setBezelStyle_(K.NSBezelStyleRounded)
-                b.setTitle_(title)
-                b.setTarget_(self)
-                b.setAction_(action)
-                v.addSubview_(b)
-                return b
+            def R(x, top, w, h):  # layout from the top-left, like a design tool
+                return K.NSMakeRect(x, H - top - h, w, h)
 
-            def label(x, y, w, size, color, mono=False, bold=False, h=16):
+            def label(rect, size, color, weight=0.0, mono=False):
                 t = K.NSTextField.labelWithString_("")
-                t.setFrame_(K.NSMakeRect(x, y, w, h))
-                weight = 0.4 if bold else 0
+                t.setFrame_(rect)
                 t.setFont_(K.NSFont.monospacedDigitSystemFontOfSize_weight_(size, weight) if mono
                            else K.NSFont.systemFontOfSize_weight_(size, weight))
                 t.setTextColor_(color)
@@ -964,48 +970,98 @@ def run_app() -> None:
                 v.addSubview_(t)
                 return t
 
-            self.rec = button(8, 92, "● Rec", "onRec:")
-            self.send = button(102, 80, "Send ⏎", "onSend:")
-            self.drop = button(184, 36, "✕", "onDiscard:")
-            self.drop.setToolTip_("Discard everything not sent yet")
-            self.auto = button(222, 162, "Auto: off", "onAuto:")
-            # what is recorded but not sent yet (recorded time only; frozen while paused)
-            self.unsent = label(12, 156, W - 24, 13, K.NSColor.whiteColor(), mono=True, bold=True, h=19)
-            rl = label(12, 130, 60, 12, K.NSColor.secondaryLabelColor())
-            rl.setStringValue_("Screen:")
-            self.pick = K.NSPopUpButton.alloc().initWithFrame_pullsDown_(
-                K.NSMakeRect(64, 124, W - 72, 26), False)
+            def icon_button(rect, sym, size, tint, action, tip):
+                b = ScreenfeedButton.alloc().initWithFrame_(rect)
+                b.setBordered_(False)
+                b.setImage_(symbol(sym, size))
+                b.setImagePosition_(K.NSImageOnly)
+                b.setContentTintColor_(tint)
+                b.setTarget_(self)
+                b.setAction_(action)
+                b.setToolTip_(tip)
+                v.addSubview_(b)
+                return b
+
+            def icon(rect, sym, size, tint):
+                iv = K.NSImageView.alloc().initWithFrame_(rect)
+                iv.setImage_(symbol(sym, size))
+                iv.setContentTintColor_(tint)
+                v.addSubview_(iv)
+                return iv
+
+            def separator(top):
+                b = K.NSBox.alloc().initWithFrame_(R(12, top, W - 24, 1))
+                b.setBoxType_(K.NSBoxSeparator)
+                v.addSubview_(b)
+
+            secondary = K.NSColor.secondaryLabelColor()
+            tertiary = K.NSColor.tertiaryLabelColor()
+
+            # header: record button, timer + state, Send capsule, discard
+            self.rec = icon_button(R(10, 12, 44, 44), "record.circle.fill", 34,
+                                   K.NSColor.systemRedColor(), "onRec:", "Record")
+            self.timer = label(R(60, 12, 140, 28), 24, tertiary, weight=-0.2, mono=True)
+            self.sub = label(R(61, 40, 150, 15), 11, secondary)
+            self.send = ScreenfeedButton.alloc().initWithFrame_(R(W - 12 - 30 - 6 - 84, 20, 84, 28))
+            self.send.setBezelStyle_(K.NSBezelStyleRounded)
+            self.send.setTitle_("Send")
+            self.send.setImage_(symbol("paperplane.fill", 12))
+            self.send.setImagePosition_(K.NSImageLeading)
+            self.send.setBezelColor_(K.NSColor.controlAccentColor())
+            self.send.setTarget_(self)
+            self.send.setAction_("onSend:")
+            self.send.setToolTip_("Send what was recorded to Claude")
+            v.addSubview_(self.send)
+            self.drop = icon_button(R(W - 12 - 30, 20, 30, 28), "trash", 15, secondary, "onDiscard:",
+                                    "Discard everything not sent yet")
+
+            # screen + auto-send pickers
+            icon(R(12, 68, 18, 18), "display", 13, secondary)
+            self.pick = K.NSPopUpButton.alloc().initWithFrame_pullsDown_(R(30, 64, 172, 26), False)
+            self.pick.setBordered_(False)
+            self.pick.setFont_(K.NSFont.systemFontOfSize_(12))
             self.pick.setTarget_(self)
             self.pick.setAction_("onScreen:")
-            self.pick.setToolTip_("Which display is recorded (picking one highlights it)")
+            self.pick.setToolTip_("Which display is recorded")
             v.addSubview_(self.pick)
             self.pick_labels = []
-            self.stat = label(12, 104, W - 92, 11, K.NSColor.secondaryLabelColor())
-            self.quit = ScreenfeedButton.alloc().initWithFrame_(K.NSMakeRect(W - 78, 98, 70, 24))
-            self.quit.setBezelStyle_(K.NSBezelStyleRounded)
-            self.quit.setControlSize_(K.NSControlSizeSmall)
-            self.quit.setFont_(K.NSFont.systemFontOfSize_(11))
-            self.quit.setTitle_("Quit")
-            self.quit.setToolTip_("Exit screenfeed (stops recording)")
-            self.quit.setTarget_(self)
-            self.quit.setAction_("onQuit:")
-            v.addSubview_(self.quit)
+            icon(R(208, 68, 18, 18), "timer", 13, secondary)
+            self.autopick = K.NSPopUpButton.alloc().initWithFrame_pullsDown_(R(226, 64, W - 12 - 226, 26), False)
+            self.autopick.setBordered_(False)
+            self.autopick.setFont_(K.NSFont.systemFontOfSize_(12))
+            self.autopick.setTarget_(self)
+            self.autopick.setAction_("onAuto:")
+            self.autopick.setToolTip_("Send automatically (batches without speech are skipped)")
+            v.addSubview_(self.autopick)
+            self.auto_steps = []
+
+            separator(98)
+            self.stat = label(R(12, 106, W - 24, 15), 11, secondary)
+            self.claude_icon = icon(R(11, 124, 16, 15), "sparkles", 11, K.NSColor.systemOrangeColor())
+            self.msg = label(R(30, 124, W - 42, 15), 11, K.NSColor.labelColor())
+
+            separator(148)
+            hdr = label(R(12, 156, 200, 13), 10, tertiary, weight=0.3)
+            hdr.setStringValue_("SENT TO CLAUDE")
+            self.hist_icons, self.hist = [], []
+            for i in range(4):
+                top = 173 + 17 * i
+                self.hist_icons.append(icon(R(11, top, 15, 15), "circle", 11, tertiary))
+                self.hist.append(label(R(30, top, W - 42, 15), 11, secondary, mono=True))
+
+            # footer: build + quit
+            self.build_lbl = label(R(12, H - 22, W - 60, 13), 9.5, tertiary, mono=True)
+            self.build_lbl.setStringValue_(BUILD)
+            self.build_lbl.setToolTip_("When the running version was built (file time · git commit,"
+                                       " + = uncommitted changes)")
+            self.quit = icon_button(R(W - 12 - 20, H - 25, 20, 18), "power", 12, tertiary, "onQuit:",
+                                    "Quit screenfeed")
             self.quit_armed = 0.0
-            self.msg = label(12, 88, W - 24, 11, K.NSColor.systemTealColor())
-            hh = label(12, 68, W - 24, 10, K.NSColor.tertiaryLabelColor(), bold=True, h=14)
-            hh.setStringValue_("SENT")
-            bl = label(12, 68, W - 24, 10, K.NSColor.tertiaryLabelColor(), mono=True, h=14)
-            bl.setAlignment_(K.NSTextAlignmentRight)
-            bl.setStringValue_(BUILD)
-            bl.setToolTip_("When the running version of screenfeed.py was built (file time · git commit, + = uncommitted changes)")
-            self.hist = [label(12, 54 - 14 * i, W - 24, 10.5, K.NSColor.secondaryLabelColor(),
-                               mono=True, h=14) for i in range(4)]
-            self.panel = p
-            self.view = v
             self.n = 0
             p.orderFrontRegardless()
             return self
 
+        # -- actions ---------------------------------------------------------------------------
         def onRec_(self, sender):
             threading.Thread(target=ctl.toggle, daemon=True).start()
 
@@ -1013,27 +1069,29 @@ def run_app() -> None:
             threading.Thread(target=ctl.send, kwargs={"manual": True}, daemon=True).start()
 
         def onAuto_(self, sender):
-            ctl.cycle_auto()
-
-        def onQuit_(self, sender):
-            # with unsent content, ask for a second click within 3 s
-            if ctl.has_unsent() and now() > self.quit_armed:
-                self.quit_armed = now() + 3
-                self.quit.setTitle_("Really?")
-                self.quit.setToolTip_("Unsent content will be lost. Click again to quit.")
-                return
-            self.quit.setTitle_("Quitting…")
-            AppHelper.callAfter(shutdown)
-
-        def onDiscard_(self, sender):
-            threading.Thread(target=ctl.discard, daemon=True).start()
+            i = int(sender.indexOfSelectedItem())
+            if 0 <= i < len(self.auto_steps):
+                ctl.set_auto(self.auto_steps[i])
 
         def onScreen_(self, sender):
             pos = int(sender.indexOfSelectedItem())  # 0 = "No screen"
             threading.Thread(target=ctl.select_screen, args=(pos or "none",), daemon=True).start()
 
+        def onQuit_(self, sender):
+            # with unsent content, ask for a second click within 3 s
+            if ctl.has_unsent() and now() > self.quit_armed:
+                self.quit_armed = now() + 3
+                self.quit.setContentTintColor_(K.NSColor.systemRedColor())
+                ctl.status = "Click ⏻ again to quit · unsent recording will be lost"
+                return
+            AppHelper.callAfter(shutdown)
+
+        def onDiscard_(self, sender):
+            threading.Thread(target=ctl.discard, daemon=True).start()
+
+        # -- refresh ---------------------------------------------------------------------------
         def syncPicker(self):
-            labels = ["No screen (recording off)"] + [s["label"] for s in ctl.screens]
+            labels = ["No screen"] + [s["label"] for s in ctl.screens]
             if labels != self.pick_labels:
                 self.pick.removeAllItems()
                 self.pick.addItemsWithTitles_(labels)
@@ -1041,6 +1099,15 @@ def run_app() -> None:
             i = labels.index(ctl.screen["label"]) if ctl.screen and ctl.screen["label"] in labels else 0
             if self.pick.indexOfSelectedItem() != i:
                 self.pick.selectItemAtIndex_(i)
+            steps = AUTO_STEPS + ([ctl.auto] if ctl.auto not in AUTO_STEPS else [])
+            if steps != self.auto_steps:
+                self.autopick.removeAllItems()
+                self.autopick.addItemsWithTitles_(
+                    [AUTO_TITLES.get(s, f"Every {fmt_dur(s)}") for s in steps])
+                self.auto_steps = steps
+            j = steps.index(ctl.auto)
+            if self.autopick.indexOfSelectedItem() != j:
+                self.autopick.selectItemAtIndex_(j)
 
         def tick_(self, timer):
             t = now()
@@ -1058,52 +1125,78 @@ def run_app() -> None:
             if self.n % 6:
                 return
             rec = ctl.recording
+            paused = not rec and bool(ctl.pending)
             sync_overlays(self.panel)
             self.syncPicker()
-            self.view.layer().setBorderWidth_(3 if rec else 0)
-            self.view.layer().setBorderColor_(K.NSColor.systemRedColor().CGColor())
-            if self.quit_armed and now() > self.quit_armed:
+            self.view.layer().setBorderWidth_(2 if rec else 0)
+            if self.quit_armed and t > self.quit_armed:
                 self.quit_armed = 0.0
-                self.quit.setTitle_("Quit")
-                self.quit.setToolTip_("Exit screenfeed (stops recording)")
-            paused = not rec and bool(ctl.pending)
-            self.rec.setTitle_("⏸ Pause" if rec else ("● Resume" if paused else "● Rec"))
-            self.rec.setBezelColor_(K.NSColor.systemRedColor() if rec else None)
-            self.rec.setEnabled_(bool(rec or ctl.screen))
-            u = fmt_dur(ctl.unsent_seconds())
+                self.quit.setContentTintColor_(K.NSColor.tertiaryLabelColor())
+
+            # record / pause / resume
             if rec:
-                self.unsent.setStringValue_(f"● REC   {u} unsent")
-                self.unsent.setTextColor_(K.NSColor.systemRedColor())
-            elif paused:
-                self.unsent.setStringValue_(f"⏸ PAUSED   {u} unsent · Send, Resume or ✕")
-                self.unsent.setTextColor_(K.NSColor.systemOrangeColor())
-            elif not ctl.screen:
-                self.unsent.setStringValue_("No screen selected · pick one to record")
-                self.unsent.setTextColor_(K.NSColor.secondaryLabelColor())
+                self.rec.setImage_(symbol("pause.circle.fill", 34))
+                self.rec.setContentTintColor_(K.NSColor.labelColor())
+                self.rec.setToolTip_("Pause (unsent recording is kept)")
             else:
-                self.unsent.setStringValue_("Nothing unsent")
-                self.unsent.setTextColor_(K.NSColor.tertiaryLabelColor())
-            self.send.setTitle_("Sending…" if ctl.sending else "Send ⏎")
+                self.rec.setImage_(symbol("record.circle.fill", 34))
+                self.rec.setContentTintColor_(K.NSColor.systemRedColor())
+                self.rec.setToolTip_("Resume recording" if paused else "Record")
+            self.rec.setEnabled_(bool(rec or ctl.screen))
+
+            # timer = recorded time not sent yet (frozen while paused)
+            self.timer.setStringValue_(fmt_dur(ctl.unsent_seconds()))
+            self.timer.setTextColor_(K.NSColor.systemRedColor() if rec else
+                                     K.NSColor.systemOrangeColor() if paused else
+                                     K.NSColor.tertiaryLabelColor())
+            if ctl.sending:
+                sub = "Sending…"
+            elif rec:
+                sub = "Recording" + (f" · sends in {fmt_dur(ctl.next_auto - t)}"
+                                     if ctl.auto and ctl.next_auto else "")
+            elif paused:
+                sub = "Paused · not sent yet"
+            elif not ctl.screen:
+                sub = "Pick a screen to record"
+            else:
+                sub = "Ready to record"
+            self.sub.setStringValue_(sub)
             self.send.setEnabled_(ctl.has_unsent() and not ctl.sending)
             self.drop.setEnabled_(ctl.has_unsent() and not ctl.sending)
-            hist = list(ctl.history)[:4]
-            for i, lab in enumerate(self.hist):
-                if i < len(hist):
-                    h = hist[i]
-                    lab.setStringValue_(
-                        f"{time.strftime('%H:%M', time.localtime(h['sent_at']))}  #{h['batch']:<3} "
-                        f"{fmt_dur(h['seconds']):>5}  {'auto' if h['auto'] else 'sent'}  {h['state']}")
-                else:
-                    lab.setStringValue_("nothing sent yet" if i == 0 and not hist else "")
-            if ctl.auto:
-                eta = f" · {fmt_dur(ctl.next_auto - t)}" if ctl.next_auto else " (paused)"
-                self.auto.setTitle_(f"Auto: every {fmt_dur(ctl.auto)}{eta}")
-            else:
-                self.auto.setTitle_("Auto: off")
+
             busy = ctl.busy + ctl.jobs.qsize()
-            self.stat.setStringValue_(ctl.status + (f"  [{busy} processing]" if busy > 1 else ""))
-            self.msg.setStringValue_(f"Claude: {ctl.claude_msg}" if ctl.claude_msg else "")
+            quiet = ctl.status in ("Ready",) or ctl.status.startswith(("Will record", "Recording "))
+            self.stat.setStringValue_(("" if quiet else ctl.status)
+                                      + (f" ({busy} processing)" if busy > 1 else ""))
+            self.msg.setStringValue_(ctl.claude_msg or "Waiting for your first batch")
+            self.msg.setTextColor_(K.NSColor.labelColor() if ctl.claude_msg else K.NSColor.tertiaryLabelColor())
             self.msg.setToolTip_(ctl.claude_msg)
+
+            hist = list(ctl.history)[:4]
+            for i, (ic, lab) in enumerate(zip(self.hist_icons, self.hist)):
+                if i >= len(hist):
+                    ic.setHidden_(True)
+                    lab.setStringValue_("Nothing sent yet" if i == 0 else "")
+                    lab.setFrameOrigin_(K.NSMakePoint(12 if i == 0 else 30, lab.frame().origin.y))
+                    continue
+                h = hist[i]
+                st = h["state"]
+                if st.startswith("→"):
+                    sym, tint, what = "checkmark.circle.fill", K.NSColor.systemGreenColor(), st[2:].replace("Claude · ", "")
+                elif st.startswith("processing"):
+                    sym, tint, what = "clock", K.NSColor.secondaryLabelColor(), "processing…"
+                elif st.startswith("skipped"):
+                    sym, tint, what = "minus.circle", K.NSColor.tertiaryLabelColor(), "skipped, nothing said"
+                else:
+                    sym, tint, what = "exclamationmark.triangle.fill", K.NSColor.systemYellowColor(), "failed"
+                ic.setHidden_(False)
+                lab.setFrameOrigin_(K.NSMakePoint(30, lab.frame().origin.y))
+                ic.setImage_(symbol(sym, 11))
+                ic.setContentTintColor_(tint)
+                lab.setStringValue_(f"{time.strftime('%H:%M', time.localtime(h['sent_at']))}  "
+                                    f"#{h['batch']}  {fmt_dur(h['seconds'])}  {what}"
+                                    + ("  · auto" if h["auto"] else ""))
+
 
     # -- HTTP API ---------------------------------------------------------------------------
     def shutdown():
@@ -1129,7 +1222,7 @@ def run_app() -> None:
             if path == "/screens":
                 sel = ctl.screen and ctl.screen["id"]
                 return self.reply({"ok": True, "screens": [
-                    {"n": i, "label": x["label"], "id": x["id"], "selected": x["id"] == sel}
+                    {"n": i, "label": x["label"], "size": x["size"], "id": x["id"], "selected": x["id"] == sel}
                     for i, x in enumerate(ctl.screens, 1)]})
             self.reply({"ok": False, "error": "not found"}, 404)
 
@@ -1284,7 +1377,7 @@ def main(argv: list[str]) -> None:
             r = api("GET", "/screens")
             print(f"{'*' if not any(x['selected'] for x in r['screens']) else ' '} 0: none (recording off)")
             for x in r["screens"]:
-                print(f"{'*' if x['selected'] else ' '} {x['n']}: {x['label']}")
+                print(f"{'*' if x['selected'] else ' '} {x['n']}: {x['label']} ({x.get('size', '')})")
             return
         elif cmd == "screen":
             which = " ".join(argv[2:])

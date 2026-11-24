@@ -6,7 +6,7 @@ description: Iterate on a UI or app from the user's narrated screen recordings. 
 # screenfeed
 
 `screenfeed` (see https://github.com/simonharrer/screenfeed) records the screen the floating widget is on,
-the microphone, and the mouse cursor. The widget has **Rec/Stop**, **Send**, and **Auto** (off, 30s, 1m, 2m, 5m).
+the microphone, and the mouse cursor. The widget has a record/pause button, **Send**, discard (trash), a display picker, auto-send (off, 30s, 1m, 2m, 5m) and a quit button.
 Each sent batch becomes `~/.screenfeed/batches/<nnnn>-<time>/timeline.md` with:
 - `SAID: "..."` lines (whisper transcript, any language, wall-clock aligned)
 - for each sentence: where the cursor rested or clicked while it was said, as a `zoom` crop and a `full` frame,
@@ -17,9 +17,9 @@ Each sent batch becomes `~/.screenfeed/batches/<nnnn>-<time>/timeline.md` with:
 
 ```
 screenfeed launch            # start the widget in the background (idempotent)
-screenfeed start | stop      # recording on/off (also the Rec/Pause/Resume button); stop = pause,
+screenfeed start | stop      # recording on/off (also the record/pause button); stop = pause,
                              #   unsent content is kept until sent or discarded
-screenfeed discard           # throw away everything recorded but not sent (also the ✕ button)
+screenfeed discard           # throw away everything recorded but not sent (also the trash button)
 screenfeed screens | screen <n|name>   # list / pick the recorded display
 screenfeed send              # cut and send the current batch now
 screenfeed auto 60 | off     # periodic sending

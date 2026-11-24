@@ -40,14 +40,15 @@ screenfeed launch
 
 | Control | What it does |
 |---|---|
-| **● Rec / ⏸ Pause / ● Resume** | Start recording, pause (unsent content is kept), resume |
-| **Send ⏎** | Cut the current batch and hand it to Claude |
-| **✕** | Discard everything not sent yet |
-| **Auto** | Send automatically every 30s, 1m, 2m or 5m (batches without speech are skipped) |
-| **Screen** | Which display is recorded, or "No screen" to disable recording; remembered across restarts |
-| **Quit** | Exit screenfeed (asks for a second click if there is unsent content) |
-| Unsent line | `● REC 0:42 unsent` or `⏸ PAUSED 0:42 unsent`; counts recorded time only |
-| SENT | The last 4 batches: time, number, length, and whether they reached Claude |
+| Record / pause button | Start recording, pause (unsent content is kept), resume |
+| Timer | Recorded time not sent yet; frozen while paused (red = recording, orange = paused) |
+| **Send** | Cut the current batch and hand it to Claude |
+| Trash | Discard everything not sent yet |
+| Display picker | Which display is recorded, or "No screen" to disable recording; remembered across restarts |
+| Auto-send picker | Off, every 30 s, 1, 2 or 5 min (batches without speech are skipped) |
+| ✨ line | The latest status message from Claude |
+| Sent to Claude | The last 4 batches: time, number, length, and whether they reached Claude |
+| Power button | Quit (asks for a second click if there is unsent content) |
 
 While the app runs, the selected display shows a green frame with a **Ready** badge, so you always
 know which screen Rec will record. While recording, it turns into a pulsing red frame with a
