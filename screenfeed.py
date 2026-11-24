@@ -917,19 +917,38 @@ def run_app() -> None:
         def acceptsFirstMouse_(self, ev):
             return True
 
-    def symbol(name: str, size: float = 15, weight: float = 0.0):
+    def symbol(name: str, size: float = 15, weight: float = 0.0, color=None):
         img = K.NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
         if img is None:
             return None
         cfg = K.NSImageSymbolConfiguration.configurationWithPointSize_weight_(size, weight)
+        if color is not None:  # fixed colour, independent of the button's tint
+            cfg = cfg.configurationByApplyingConfiguration_(
+                K.NSImageSymbolConfiguration.configurationWithPaletteColors_([color]))
         return img.imageWithSymbolConfiguration_(cfg)
+
+    def style_button(b, title, sym, bg, fg, enabled):
+        """Colour a self-drawn button; only touches it when its state changes."""
+        key = (title, sym, enabled)
+        if getattr(b, "sf_key", None) == key:
+            return
+        b.sf_key = key
+        b.setEnabled_(enabled)
+        b.layer().setBackgroundColor_(bg.CGColor())
+        para = K.NSMutableParagraphStyle.alloc().init()
+        para.setAlignment_(K.NSTextAlignmentCenter)
+        b.setAttributedTitle_(K.NSAttributedString.alloc().initWithString_attributes_(
+            "  " + title, {K.NSForegroundColorAttributeName: fg,
+                           K.NSFontAttributeName: K.NSFont.systemFontOfSize_weight_(13, 0.23),
+                           K.NSParagraphStyleAttributeName: para}))
+        b.setImage_(symbol(sym, 11, color=fg))
 
     AUTO_TITLES = {0: "Auto-send off", 30: "Every 30 s", 60: "Every minute", 120: "Every 2 min",
                    300: "Every 5 min"}
 
     class ScreenfeedUI(K.NSObject):
         def build(self):
-            W, H = 340, 258
+            W, H = 340, 286
             self.W, self.H = W, H
             vf = K.NSScreen.mainScreen().visibleFrame()
             rect = K.NSMakeRect(vf.origin.x + vf.size.width - W - 24, vf.origin.y + 24, W, H)
@@ -997,27 +1016,31 @@ def run_app() -> None:
             secondary = K.NSColor.secondaryLabelColor()
             tertiary = K.NSColor.tertiaryLabelColor()
 
-            # header: record button, timer + state, Send capsule, discard
-            self.rec = icon_button(R(10, 12, 44, 44), "record.circle.fill", 34,
-                                   K.NSColor.systemRedColor(), "onRec:", "Record")
-            self.timer = label(R(60, 12, 140, 28), 24, tertiary, weight=-0.2, mono=True)
-            self.sub = label(R(61, 40, 150, 15), 11, secondary)
-            self.send = ScreenfeedButton.alloc().initWithFrame_(R(W - 12 - 30 - 6 - 84, 20, 84, 28))
-            self.send.setBezelStyle_(K.NSBezelStyleRounded)
-            self.send.setTitle_("Send")
-            self.send.setImage_(symbol("paperplane.fill", 12))
-            self.send.setImagePosition_(K.NSImageLeading)
-            self.send.setBezelColor_(K.NSColor.controlAccentColor())
-            self.send.setTarget_(self)
-            self.send.setAction_("onSend:")
-            self.send.setToolTip_("Send what was recorded to Claude")
-            v.addSubview_(self.send)
-            self.drop = icon_button(R(W - 12 - 30, 20, 30, 28), "trash", 15, secondary, "onDiscard:",
-                                    "Discard everything not sent yet")
+            # header: timer + state, then Record / Send / discard as real buttons
+            self.timer = label(R(12, 10, 86, 32), 26, tertiary, weight=-0.2, mono=True)
+            self.sub = label(R(100, 20, W - 112, 16), 12, secondary)
+            def capsule(rect, action, tip):
+                # self-drawn button: keeps its colours although the panel is never the key window
+                b = ScreenfeedButton.alloc().initWithFrame_(rect)
+                b.setBordered_(False)
+                b.setWantsLayer_(True)
+                b.layer().setCornerRadius_(8)
+                b.setImagePosition_(K.NSImageLeading)
+                b.setImageHugsTitle_(True)
+                b.setTarget_(self)
+                b.setAction_(action)
+                b.setToolTip_(tip)
+                v.addSubview_(b)
+                return b
+
+            self.rec = capsule(R(10, 48, 104, 30), "onRec:", "Start recording")
+            self.send = capsule(R(120, 48, 100, 30), "onSend:", "Send what was recorded to Claude")
+            self.drop = capsule(R(226, 48, W - 10 - 226, 30), "onDiscard:",
+                                "Throw away what was recorded but not sent yet (it never reaches Claude)")
 
             # screen + auto-send pickers
-            icon(R(12, 68, 18, 18), "display", 13, secondary)
-            self.pick = K.NSPopUpButton.alloc().initWithFrame_pullsDown_(R(30, 64, 172, 26), False)
+            icon(R(12, 92, 18, 18), "display", 13, secondary)
+            self.pick = K.NSPopUpButton.alloc().initWithFrame_pullsDown_(R(30, 88, 172, 26), False)
             self.pick.setBordered_(False)
             self.pick.setFont_(K.NSFont.systemFontOfSize_(12))
             self.pick.setTarget_(self)
@@ -1025,8 +1048,8 @@ def run_app() -> None:
             self.pick.setToolTip_("Which display is recorded")
             v.addSubview_(self.pick)
             self.pick_labels = []
-            icon(R(208, 68, 18, 18), "timer", 13, secondary)
-            self.autopick = K.NSPopUpButton.alloc().initWithFrame_pullsDown_(R(226, 64, W - 12 - 226, 26), False)
+            icon(R(208, 92, 18, 18), "timer", 13, secondary)
+            self.autopick = K.NSPopUpButton.alloc().initWithFrame_pullsDown_(R(226, 88, W - 12 - 226, 26), False)
             self.autopick.setBordered_(False)
             self.autopick.setFont_(K.NSFont.systemFontOfSize_(12))
             self.autopick.setTarget_(self)
@@ -1035,17 +1058,17 @@ def run_app() -> None:
             v.addSubview_(self.autopick)
             self.auto_steps = []
 
-            separator(98)
-            self.stat = label(R(12, 106, W - 24, 15), 11, secondary)
-            self.claude_icon = icon(R(11, 124, 16, 15), "sparkles", 11, K.NSColor.systemOrangeColor())
-            self.msg = label(R(30, 124, W - 42, 15), 11, K.NSColor.labelColor())
+            separator(122)
+            self.stat = label(R(12, 130, W - 24, 15), 11, secondary)
+            self.claude_icon = icon(R(11, 148, 16, 15), "sparkles", 11, K.NSColor.systemOrangeColor())
+            self.msg = label(R(30, 148, W - 42, 15), 11, K.NSColor.labelColor())
 
-            separator(148)
-            hdr = label(R(12, 156, 200, 13), 10, tertiary, weight=0.3)
+            separator(172)
+            hdr = label(R(12, 180, 200, 13), 10, tertiary, weight=0.3)
             hdr.setStringValue_("SENT TO CLAUDE")
             self.hist_icons, self.hist = [], []
             for i in range(4):
-                top = 173 + 17 * i
+                top = 197 + 17 * i
                 self.hist_icons.append(icon(R(11, top, 15, 15), "circle", 11, tertiary))
                 self.hist.append(label(R(30, top, W - 42, 15), 11, secondary, mono=True))
 
@@ -1090,6 +1113,7 @@ def run_app() -> None:
             threading.Thread(target=ctl.discard, daemon=True).start()
 
         # -- refresh ---------------------------------------------------------------------------
+
         def syncPicker(self):
             labels = ["No screen"] + [s["label"] for s in ctl.screens]
             if labels != self.pick_labels:
@@ -1133,16 +1157,26 @@ def run_app() -> None:
                 self.quit_armed = 0.0
                 self.quit.setContentTintColor_(K.NSColor.tertiaryLabelColor())
 
-            # record / pause / resume
+            # record / pause / resume, send, discard: colours carry the state
+            red = K.NSColor.systemRedColor()
+            blue = K.NSColor.systemBlueColor()
+            white = K.NSColor.whiteColor()
+            dim_bg = K.NSColor.colorWithWhite_alpha_(1.0, 0.07)
+            dim_fg = K.NSColor.colorWithWhite_alpha_(1.0, 0.35)
+            neutral_bg = K.NSColor.colorWithWhite_alpha_(1.0, 0.16)
+            can_rec = bool(rec or ctl.screen)
             if rec:
-                self.rec.setImage_(symbol("pause.circle.fill", 34))
-                self.rec.setContentTintColor_(K.NSColor.labelColor())
+                style_button(self.rec, "Pause", "pause.fill", neutral_bg, white, True)
                 self.rec.setToolTip_("Pause (unsent recording is kept)")
             else:
-                self.rec.setImage_(symbol("record.circle.fill", 34))
-                self.rec.setContentTintColor_(K.NSColor.systemRedColor())
-                self.rec.setToolTip_("Resume recording" if paused else "Record")
-            self.rec.setEnabled_(bool(rec or ctl.screen))
+                style_button(self.rec, "Resume" if paused else "Record", "circle.fill",
+                                   red if can_rec else dim_bg, white if can_rec else dim_fg, can_rec)
+                self.rec.setToolTip_("Resume recording" if paused else "Start recording")
+            can_send = ctl.has_unsent() and not ctl.sending
+            style_button(self.send, "Sending…" if ctl.sending else "Send", "paperplane.fill",
+                               blue if can_send else dim_bg, white if can_send else dim_fg, can_send)
+            style_button(self.drop, "Discard", "trash", neutral_bg if can_send else dim_bg,
+                               white if can_send else dim_fg, can_send)
 
             # timer = recorded time not sent yet (frozen while paused)
             self.timer.setStringValue_(fmt_dur(ctl.unsent_seconds()))
@@ -1161,8 +1195,6 @@ def run_app() -> None:
             else:
                 sub = "Ready to record"
             self.sub.setStringValue_(sub)
-            self.send.setEnabled_(ctl.has_unsent() and not ctl.sending)
-            self.drop.setEnabled_(ctl.has_unsent() and not ctl.sending)
 
             busy = ctl.busy + ctl.jobs.qsize()
             quiet = ctl.status in ("Ready",) or ctl.status.startswith(("Will record", "Recording "))

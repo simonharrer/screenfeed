@@ -40,10 +40,10 @@ screenfeed launch
 
 | Control | What it does |
 |---|---|
-| Record / pause button | Start recording, pause (unsent content is kept), resume |
+| **Record / Pause / Resume** | Start recording, pause (unsent content is kept), resume |
 | Timer | Recorded time not sent yet; frozen while paused (red = recording, orange = paused) |
 | **Send** | Cut the current batch and hand it to Claude |
-| Trash | Discard everything not sent yet |
+| **Discard** | Throw away what was recorded but not sent yet; it never reaches Claude |
 | Display picker | Which display is recorded, or "No screen" to disable recording; remembered across restarts |
 | Auto-send picker | Off, every 30 s, 1, 2 or 5 min (batches without speech are skipped) |
 | ✨ line | The latest status message from Claude |
