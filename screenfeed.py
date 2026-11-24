@@ -969,11 +969,28 @@ def run_app() -> None:
             v.setMaterial_(K.NSVisualEffectMaterialHUDWindow)
             v.setBlendingMode_(K.NSVisualEffectBlendingModeBehindWindow)
             v.setState_(K.NSVisualEffectStateActive)
-            v.setWantsLayer_(True)
-            v.layer().setCornerRadius_(16)
-            v.layer().setMasksToBounds_(True)
-            v.layer().setBorderColor_(K.NSColor.systemRedColor().CGColor())
+            # rounded shape via maskImage: clips the blur AND gives the window a rounded shadow
+            radius = 16.0
+
+            def draw_mask(rect):
+                K.NSColor.blackColor().set()
+                K.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(rect, radius, radius).fill()
+                return True
+
+            mask = K.NSImage.imageWithSize_flipped_drawingHandler_(
+                K.NSMakeSize(radius * 2 + 1, radius * 2 + 1), False, draw_mask)
+            mask.setCapInsets_(K.NSEdgeInsetsMake(radius, radius, radius, radius))
+            mask.setResizingMode_(K.NSImageResizingModeStretch)
+            v.setMaskImage_(mask)
             p.setContentView_(v)
+            # thin edge like native HUD windows; turns red while recording
+            edge = K.NSView.alloc().initWithFrame_(K.NSMakeRect(0, 0, W, H))
+            edge.setWantsLayer_(True)
+            edge.layer().setCornerRadius_(radius)
+            edge.layer().setBorderWidth_(0.5)
+            edge.layer().setBorderColor_(K.NSColor.colorWithWhite_alpha_(1.0, 0.18).CGColor())
+            v.addSubview_(edge)
+            self.edge = edge
             self.panel, self.view = p, v
 
             def R(x, top, w, h):  # layout from the top-left, like a design tool
@@ -1082,6 +1099,7 @@ def run_app() -> None:
             self.quit_armed = 0.0
             self.n = 0
             p.orderFrontRegardless()
+            p.invalidateShadow()
             return self
 
         # -- actions ---------------------------------------------------------------------------
@@ -1152,7 +1170,11 @@ def run_app() -> None:
             paused = not rec and bool(ctl.pending)
             sync_overlays(self.panel)
             self.syncPicker()
-            self.view.layer().setBorderWidth_(2 if rec else 0)
+            if getattr(self, "edge_rec", None) != rec:
+                self.edge_rec = rec
+                self.edge.layer().setBorderWidth_(2 if rec else 0.5)
+                self.edge.layer().setBorderColor_(
+                    (K.NSColor.systemRedColor() if rec else K.NSColor.colorWithWhite_alpha_(1.0, 0.18)).CGColor())
             if self.quit_armed and t > self.quit_armed:
                 self.quit_armed = 0.0
                 self.quit.setContentTintColor_(K.NSColor.tertiaryLabelColor())
