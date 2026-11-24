@@ -22,6 +22,8 @@ screenfeed start | stop      # recording on/off (also the record/pause button); 
 screenfeed discard           # throw away everything recorded but not sent (also the Discard button)
 screenfeed screens | screen <n|name>   # list / pick the recorded display
 screenfeed send              # cut and send the current batch now
+screenfeed retry <n>         # process a failed batch again from the raw video it kept
+screenfeed languages [en,de|auto]  # spoken languages (default en,de); others are re-read in the last allowed one
 screenfeed auto 60 | off     # periodic sending
 screenfeed say "text"        # show a short status line from Claude in the widget
 screenfeed status            # JSON state
@@ -55,6 +57,10 @@ Never test with `say` or other audio playback; the user may be in a call. Only r
 
 ## Notes
 
+- No batch is lost by design: one recorder per session writes 2 s chunks and Send only cuts by time;
+  a watchdog replaces a dead or stalled recorder (the batch lists the gap); a failed batch keeps its raw
+  video (error event says `screenfeed retry <n>`; run it); content left by a crash or quit arrives as a
+  recovered batch on the next start (no cursor data, so no pointing frames).
 - Auto-sent batches without speech are skipped; a manual Send always produces a batch.
 - The widget shows the unsent recorded time (frozen while paused) and a SENT history of the last
   4 batches (time, number, length, auto/manual, processing / → Claude / skipped / failed).
@@ -66,7 +72,10 @@ Never test with `say` or other audio playback; the user may be in a call. Only r
   "This screen will be recorded" on it for 2s; while recording, switching moves the recording at once
   and keeps what was recorded so far in the batch. While recording, that display gets a pulsing red frame and a
   "● REC" badge, and the widget gets a red border; other displays show "Not recorded".
-- Config via env vars: `SCREENFEED_LANG` (default auto), `SCREENFEED_AUDIO` (mic name or `none`,
+- Config via env vars: `SCREENFEED_LANGUAGES` (default `en,de`; or `screenfeed languages`), `SCREENFEED_LANG` (one fixed language), `SCREENFEED_AUDIO` (mic name or `none`,
   default system input), `SCREENFEED_FPS` (5), `SCREENFEED_KEEP_VIDEO=1`, `SCREENFEED_WHISPER_MODEL`.
+- Debugging: every action (widget clicks, CLI/API calls, recorder start/stop with pid, exit code and
+  file size, sends, batch processing, uncaught errors with tracebacks) is logged to
+  `~/.screenfeed/screenfeed.log` (rotated to `.log.1` at 5 MB). Read it first when a batch does not arrive.
 - Data lives in `~/.screenfeed`; raw video is deleted after each batch is processed. Batches (frames and
   transcripts) stay until deleted; they can contain whatever was on screen.

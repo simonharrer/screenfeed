@@ -24,11 +24,20 @@ Commands:
   screenfeed screen <n|name>  record that display (switches immediately when recording)
   screenfeed screen none      no screen: recording disabled (pauses a running recording)
   screenfeed send             cut the current batch and send it
+  screenfeed retry <n>        process a failed batch again from the raw video it kept
+  screenfeed languages [x,y|auto]  show or set the spoken languages (default en,de); others are re-read
+                              in the last allowed one (whisper invents foreign text on silence)
   screenfeed auto <sec|off>   send automatically every <sec> seconds
   screenfeed say <text>       show a message from Claude in the widget
   screenfeed status           JSON status
   screenfeed watch            print one line per ready batch (for Claude's Monitor tool)
-  screenfeed quit             stop the app
+  screenfeed quit             stop the app (unsent content is sent as a recovered batch on next start)
+
+No batch is lost: one recorder runs per recording session and writes 2-second chunks; Send only cuts
+by time. Chunks stay in ~/.screenfeed/raw until their batch is processed; a failed batch keeps its
+raw video for `retry`; content left by a crash or quit becomes a recovered batch on the next start.
+A watchdog restarts a recorder that dies or stalls and the gap is noted in the batch.
+Every action is logged to ~/.screenfeed/screenfeed.log.
 """
 from __future__ import annotations
 
@@ -56,7 +65,8 @@ MODEL = os.environ.get(
     "SCREENFEED_WHISPER_MODEL",
     str(Path.home() / ".local/share/whisper-models/ggml-large-v3-turbo.bin"),
 )
-LANG = os.environ.get("SCREENFEED_LANG", "auto")
+LANG = os.environ.get("SCREENFEED_LANG", "auto")  # one fixed language; overrides the default list below
+DEFAULT_LANGUAGES = os.environ.get("SCREENFEED_LANGUAGES", "en,de")
 AUDIO = os.environ.get("SCREENFEED_AUDIO", "")  # device name, "none", or "" = system default input
 FPS = int(os.environ.get("SCREENFEED_FPS", "5"))
 KEEP_VIDEO = os.environ.get("SCREENFEED_KEEP_VIDEO") == "1"
@@ -85,15 +95,30 @@ BUILD = build_info()
 FFPROBE = shutil.which("ffprobe") or "/opt/homebrew/bin/ffprobe"
 WHISPER = shutil.which("whisper-cli") or "/opt/homebrew/bin/whisper-cli"
 AUTO_STEPS = [0, 30, 60, 120, 300]
-CUT_OVERLAP = 1.2  # seconds the old recorder keeps running after the new one starts (no gap)
+CHUNK_SECONDS = 2  # the recorder writes chunks this long; a batch cut waits at most this for its last one
+STALL_SECONDS = 8.0  # recorder captured no frame for this long while recording: the watchdog replaces it
+MAX_RESTARTS = 3  # watchdog restarts in a row before recording stops with an error
+END_MARGIN = 0.3  # the END STATE frame is taken this long before the cut
 
 READY = HOME / "ready.jsonl"
 BATCHES = HOME / "batches"
 RAW = HOME / "raw"
+CONSUMED = RAW / "consumed_until"
 
 
 def now() -> float:
     return time.time()
+
+
+def fmt_ago(t: float) -> str:
+    """How long ago, as the widget shows it: "just now", "1 min ago", "2 h ago". Whole minutes only, so
+    that nothing in the widget ticks every second (the recorded-time timer is the only seconds counter)."""
+    sec = max(0, int(now() - t))
+    if sec < 60:
+        return "just now"
+    if sec < 3600:
+        return f"{sec // 60} min ago"
+    return f"{sec // 3600} h ago"
 
 
 def fmt_dur(sec: float) -> str:
@@ -105,6 +130,52 @@ def emit(event: dict) -> None:
     HOME.mkdir(parents=True, exist_ok=True)
     with READY.open("a") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    log("emit", event=json.dumps(event, ensure_ascii=False)[:300])
+
+
+# --------------------------------------------------------------------------------------------
+# Debug log: one line per action in ~/.screenfeed/screenfeed.log (rotated to .log.1 at 5 MB)
+# --------------------------------------------------------------------------------------------
+
+LOG = HOME / "screenfeed.log"
+LOG_MAX = 5 * 1024 * 1024
+_log_lock = threading.Lock()
+
+
+def log(msg: str, detail: str | None = None, **fields) -> None:
+    """Append `time [thread] msg key=value ...`; `detail` (e.g. a traceback) follows, indented."""
+    t = now()
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)) + f".{int(t * 1000) % 1000:03d}"
+    parts = [f"{stamp} [{threading.current_thread().name}] {msg}"]
+    for k, v in fields.items():
+        v = f"{v:.2f}" if isinstance(v, float) else str(v)
+        parts.append(f"{k}={json.dumps(v, ensure_ascii=False) if (not v or ' ' in v) else v}")
+    text = " ".join(parts) + "\n"
+    if detail:
+        text += "".join(f"    {line}\n" for line in detail.rstrip().splitlines())
+    with _log_lock:
+        try:
+            HOME.mkdir(parents=True, exist_ok=True)
+            if LOG.exists() and LOG.stat().st_size > LOG_MAX:
+                LOG.replace(LOG.with_name(LOG.name + ".1"))
+            with LOG.open("a") as f:
+                f.write(text)
+        except OSError:
+            pass
+
+
+def log_exc(msg: str, exc: BaseException, **fields) -> None:
+    import traceback
+
+    log(msg, detail="".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), error=f"{type(exc).__name__}: {exc}", **fields)
+
+
+def _log_uncaught(args: threading.ExceptHookArgs) -> None:
+    """Exceptions that end a thread (e.g. a failed Send) would otherwise only reach app.log."""
+    if args.exc_value is not None:
+        log_exc("UNCAUGHT exception, thread ended", args.exc_value,
+                thread=args.thread.name if args.thread else "?")
+    threading.__excepthook__(args)
 
 
 # --------------------------------------------------------------------------------------------
@@ -124,6 +195,14 @@ def default_audio_device() -> str:
         return "none"
 
 
+def media_length(path: Path) -> float:
+    """Length of a possibly unfinished (killed) Matroska file: its last packet time over all streams."""
+    r = subprocess.run([FFPROBE, "-v", "error", "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(path)],
+                       capture_output=True, text=True)
+    ts = [float(x) for x in r.stdout.split() if x.replace(".", "", 1).isdigit()]
+    return max(ts, default=0.0)
+
+
 def probe_duration(path: Path) -> float:
     r = subprocess.run(
         [FFPROBE, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
@@ -135,78 +214,230 @@ def probe_duration(path: Path) -> float:
         return 0.0
 
 
-class Segment:
-    """One ffmpeg recording. Wall-clock mapping: actual_start = stop time - recorded duration."""
+def read_consumed() -> float:
+    """Wall-clock time up to which recorded content has been processed into batches or discarded."""
+    try:
+        return float(CONSUMED.read_text().strip())
+    except (OSError, ValueError):
+        return 0.0
 
-    def __init__(self, screen: dict, audio: str):
-        RAW.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(now() * 1000) % 1000:03d}"
-        self.path = RAW / f"seg-{stamp}.mkv"
-        self.log = RAW / f"seg-{stamp}.log"
+
+def write_consumed(t: float) -> None:
+    RAW.mkdir(parents=True, exist_ok=True)
+    tmp = CONSUMED.with_name(CONSUMED.name + ".tmp")
+    tmp.write_text(f"{t:.3f}")
+    tmp.replace(CONSUMED)
+
+
+class Recorder:
+    """One ffmpeg for one recording session: from Rec until Pause, a screen switch or a recorder failure.
+
+    It writes CHUNK_SECONDS-long chunks and lists each finished one in chunks.csv. Sending a batch only
+    cuts by time and never stops or starts the recorder, so a batch cannot be lost to a recorder that fails
+    to stop or to start. Chunks stay on disk until every batch that uses them has been processed (or the
+    content was discarded), so a crash, a quit or a failed processing step loses nothing either. Only one
+    recorder runs at a time: a second capture of the same screen and microphone can hang.
+    """
+
+    def __init__(self, screen: dict, audio: str, folder: Path | None = None):
+        if folder is None:
+            stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(now() * 1000) % 1000:03d}"
+            folder = RAW / f"rec-{stamp}"
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "meta.json").write_text(json.dumps({"screen": screen, "audio": audio}))
+        self.dir = folder
+        self.name = folder.name
         self.screen = screen
         self.audio = audio
         self.proc: subprocess.Popen | None = None
-        self.clip_from = now()
-        self.clip_to: float | None = None
-        self.actual_start: float | None = None
-        self.duration = 0.0
+        self.started_at = now()
+        self.stopped_at: float | None = None
+        self.origin: float | None = None  # wall-clock time of stream time 0
+        self.seen_frames = 0  # watchdog: frames captured when last checked, and when that last grew
+        self.grew_at = now()
+        self.warned = False
+
+    @classmethod
+    def load(cls, folder: Path) -> "Recorder":
+        """A recorder folder left by an earlier run (crash or quit), for recovery."""
+        meta = json.loads((folder / "meta.json").read_text())
+        r = cls(meta["screen"], meta["audio"], folder)
+        r.started_at = (folder / "meta.json").stat().st_mtime  # written when the recorder started
+        ch = r.chunks(partial=True)
+        r.started_at = ch[0]["start"] if ch else folder.stat().st_mtime
+        r.stopped_at = ch[-1]["end"] if ch else r.started_at
+        return r
 
     def start(self) -> None:
         cmd = [
             FFMPEG, "-hide_banner", "-loglevel", "warning", "-nostats", "-y",
+            # On some macOS versions AVFoundation hands out screen frames with pts 0 (and ignores
+            # -framerate); without wall-clock timestamps the video time barely advances and no chunk is
+            # ever finished. fps= then brings the frame rate down to FPS.
+            "-use_wallclock_as_timestamps", "1",
             "-f", "avfoundation", "-capture_cursor", "1", "-capture_mouse_clicks", "1",
             "-framerate", str(FPS),
             "-i", f"Capture screen {self.screen['index']}:{self.audio}",
-            "-vf", "scale='min(3840,iw)':-2",
-            "-c:v", "h264_videotoolbox", "-b:v", "5M", "-g", str(FPS * 2),
+            "-vf", f"fps={FPS},scale='min(3840,iw)':-2",
+            "-c:v", "h264_videotoolbox", "-b:v", "5M", "-g", str(FPS * CHUNK_SECONDS),
         ]
         if self.audio != "none":
             cmd += ["-c:a", "aac", "-b:a", "96k", "-ac", "1"]
-        cmd.append(str(self.path))
-        self.clip_from = now()
+        cmd += [
+            "-f", "segment", "-segment_time", str(CHUNK_SECONDS), "-segment_format", "matroska",
+            "-reset_timestamps", "1", "-segment_list", str(self.dir / "chunks.csv"),
+            "-segment_list_type", "csv", "-segment_list_flags", "+live",
+            str(self.dir / "chunk-%05d.mkv"),
+            # frame counter once a second: the watchdog's sign of life, whatever the muxer buffers
+            "-progress", str(self.dir / "progress.txt"), "-stats_period", "1",
+        ]
+        self.started_at = self.grew_at = now()
         self.proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self.log.open("w"),
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=(self.dir / "ffmpeg.log").open("w"),
         )
+        log("recorder start", rec=self.name, pid=self.proc.pid,
+            screen=f"{self.screen['index']}:{self.screen.get('label', '')}", audio=self.audio)
 
-    def stop(self) -> float:
-        cut = now()
-        self.clip_to = cut
-        if self.proc and self.proc.poll() is None:
+    def alive(self) -> bool:
+        return bool(self.proc and self.proc.poll() is None)
+
+    def chunks(self, partial: bool = False) -> list[dict]:
+        """Chunks still on disk, oldest first, as {path, start, end} in wall-clock time. Finished chunks
+        only, unless `partial`: then also chunk files ffmpeg never listed (the one being written, or the
+        last one of a killed recorder), timed from their packets; those are never thrown away unread.
+
+        A chunk file is last written when the chunk is finished, so its mtime minus its end in stream time is
+        the wall-clock time of stream time 0 plus a small write latency; the smallest value seen is the best
+        estimate of the origin.
+        """
+        try:
+            rows = (self.dir / "chunks.csv").read_text().splitlines()
+        except OSError:
+            return []
+        out = []
+        for row in rows:
+            cols = row.rsplit(",", 2)
+            if len(cols) != 3:
+                continue
+            p = Path(cols[0]) if os.path.isabs(cols[0]) else self.dir / cols[0]
             try:
-                self.proc.stdin.write(b"q")
-                self.proc.stdin.flush()
-            except Exception:
-                pass
+                a, b, m = float(cols[1]), float(cols[2]), p.stat().st_mtime
+            except (OSError, ValueError):
+                continue  # deleted (consumed) or not a chunk line
+            self.origin = m - b if self.origin is None else min(self.origin, m - b)
+            out.append((p, a, b))
+        if self.origin is not None and self.origin - self.started_at > 2 * CHUNK_SECONDS + 3:
+            # packet times far behind the wall clock (pts 0 from the capture): time chunks by when written
+            res, at = [], self.started_at
+            for p, a, b in out:
+                end = max(at + (b - a), p.stat().st_mtime)
+                res.append({"path": str(p), "start": at, "end": end})
+                at = end
+        else:
+            res = [{"path": str(p), "start": self.origin + a, "end": self.origin + b} for p, a, b in out]
+        if partial:
+            listed = {Path(c["path"]).name for c in res}
+            at = res[-1]["end"] if res else self.started_at
+            for p in sorted(self.dir.glob("chunk-*.mkv")):
+                if p.name in listed or p.stat().st_size == 0:
+                    continue
+                dur = media_length(p)
+                if dur <= 0:
+                    log("unreadable unlisted chunk kept", rec=self.name, chunk=p.name, bytes=p.stat().st_size)
+                    continue
+                # its packet times can be wrong (pts 0 from the capture); when it was last written is not
+                end = max(at + dur, p.stat().st_mtime)
+                res.append({"path": str(p), "start": at, "end": end, "partial": True})
+                at = end
+        return res
+
+    def frames_captured(self) -> int:
+        """Frames ffmpeg has encoded so far (from its -progress output), 0 before the first report."""
+        try:
+            with (self.dir / "progress.txt").open("rb") as f:
+                f.seek(max(0, f.seek(0, 2) - 600))
+                tail = f.read().decode(errors="replace")
+        except OSError:
+            return 0
+        # frames encoded plus frames dropped: input still arriving is the sign of life
+        last = lambda key: int((re.findall(rf"^{key}=(\d+)", tail, re.M) or ["0"])[-1])  # noqa: E731
+        return last("frame") + last("drop_frames")
+
+    def last_chunk_at(self) -> float:
+        """When the newest chunk was finished; before the first one, when the recorder started."""
+        try:
+            return max(self.started_at, (self.dir / "chunks.csv").stat().st_mtime)
+        except OSError:
+            return self.started_at
+
+    def stop(self) -> None:
+        """Stop ffmpeg: q (finishes the current chunk), then SIGTERM, then SIGKILL. Never raises: at worst
+        the chunk being written (CHUNK_SECONDS) is lost; everything before it is on disk already."""
+        self.stopped_at = self.stopped_at or now()
+        p = self.proc
+        if not p or p.poll() is not None:
+            log("recorder stop: already ended", rec=self.name, exit=p.returncode if p else None)
+            return
+        log("recorder stop requested", rec=self.name, pid=p.pid, chunks=len(self.chunks()))
+        try:
+            p.stdin.write(b"q")
+            p.stdin.flush()
+        except Exception as e:  # noqa: BLE001
+            log("recorder stop: sending q failed", rec=self.name, error=repr(e))
+        for how, timeout in (("q", 6), ("SIGTERM", 3), ("SIGKILL", 3)):
+            if how == "SIGTERM":
+                p.terminate()
+            elif how == "SIGKILL":
+                p.kill()
             try:
-                self.proc.wait(timeout=15)
+                p.wait(timeout=timeout)
+                break
             except subprocess.TimeoutExpired:
-                self.proc.terminate()
-                self.proc.wait(timeout=5)
-        self.duration = probe_duration(self.path)
-        self.actual_start = cut - self.duration
-        return cut
+                log(f"recorder ignored {how} for {timeout}s", rec=self.name, pid=p.pid,
+                    ffmpeg=self.log_tail())
+        log("recorder stopped", rec=self.name, pid=p.pid, exit=p.returncode, chunks=len(self.chunks()),
+            took=now() - self.stopped_at)
 
     def log_tail(self) -> str:
         try:
-            return " | ".join(self.log.read_text(errors="replace").strip().splitlines()[-3:])
-        except Exception:
+            return " | ".join((self.dir / "ffmpeg.log").read_text(errors="replace").strip().splitlines()[-3:])
+        except Exception:  # noqa: BLE001
             return ""
 
-    def discard(self) -> None:
-        for p in (self.path, self.log):
-            p.unlink(missing_ok=True)
+    def delete_chunks_until(self, t: float) -> int:
+        n = 0
+        for c in self.chunks(partial=not self.alive()):
+            if c["end"] <= t + 0.01:
+                Path(c["path"]).unlink(missing_ok=True)
+                n += 1
+        return n
+
+
+class Clip:
+    """The chunks of one recorder that a batch covers, joined into one file: what transcription and frame
+    rendering read. Wall clock = actual_start + offset in the file."""
+
+    def __init__(self, path: Path, screen: dict, audio: str, actual_start: float, duration: float,
+                 clip_from: float, clip_to: float):
+        self.path, self.screen, self.audio = path, screen, audio
+        self.actual_start, self.duration = actual_start, duration
+        self.clip_from, self.clip_to = clip_from, clip_to
 
 
 class Controller:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.recording = False
-        self.seg: Segment | None = None
-        self.pending: list[Segment] = []
-        self.rec_since: float | None = None  # start of content not yet sent
+        self.rec: Recorder | None = None  # the running recorder
+        self.recorders: list[Recorder] = []  # recorders whose chunks are not all consumed yet
+        self.rec_since: float | None = None  # start of content not yet sent (the last cut)
+        self.restarting = False  # a recorder is being replaced (screen switch or watchdog)
+        self.restarts = 0  # watchdog restarts in a row without a new chunk
+        self.next_watch = 0.0
         self.auto = 0
         self.next_auto: float | None = None
-        self.sending = False
+        self.sending = False  # kept for the widget; sending is instant now
         self.samples: deque = deque()  # (t, x, y, buttons, in_widget)
         self.apps: deque = deque()  # (t, frontmost app name)
         self.screen: dict | None = None  # the selected screen (recorded on next start / now)
@@ -215,48 +446,94 @@ class Controller:
         self.widget_frame = (0, 0, 0, 0)
         self.status = "Ready"
         self.claude_msg = ""
+        self.claude_msg_at: float | None = None
         self.last_batch: dict | None = None
         self.history: deque = deque(maxlen=20)  # newest first: sent batches and their fate
         self.busy = 0
         self.batch_no = self._next_batch_no()
         self.jobs: queue.Queue = queue.Queue()
-        threading.Thread(target=self._worker, daemon=True).start()
+        self._recover()
+        threading.Thread(target=self._worker, daemon=True, name="worker").start()
 
     def _next_batch_no(self) -> int:
         BATCHES.mkdir(parents=True, exist_ok=True)
         nums = [int(m.group(1)) for p in BATCHES.iterdir() if (m := re.match(r"(\d+)-", p.name))]
         return max(nums, default=0) + 1
 
+    def _recover(self) -> None:
+        """Recorded content of an earlier run that never made it into a processed batch (crash, quit,
+        processing interrupted) becomes a batch now instead of being deleted."""
+        if not RAW.exists():
+            return
+        for p in RAW.glob("seg-*"):  # files of the old one-recorder-per-batch format
+            log("old raw file deleted", file=p.name)
+            p.unlink(missing_ok=True)
+        consumed = read_consumed()
+        recs = []
+        for folder in sorted(RAW.glob("rec-*")):
+            try:
+                r = Recorder.load(folder)
+            except Exception as e:  # noqa: BLE001
+                log_exc("recover: unreadable recorder folder, kept as is", e, rec=folder.name)
+                continue
+            if any(c["end"] > consumed + 0.5 for c in r.chunks(partial=True)):
+                recs.append(r)
+            else:
+                log("recover: nothing unsent, folder removed", rec=folder.name)
+                shutil.rmtree(folder, ignore_errors=True)
+        log("recover", consumed=consumed, recorders=",".join(r.name for r in recs) or "none")
+        if recs:
+            self.recorders = recs
+            t0 = max(consumed, min(r.started_at for r in recs))
+            t1 = max(r.stopped_at or r.started_at for r in recs)
+            self.rec_since = t1
+            no = self._queue(t0, t1, manual=True, samples=[], apps=[], recovered=True)
+            self.status = f"Batch {no}: recovered from last run, processing…"
+
     # -- recording control ---------------------------------------------------------------
 
+    def _recorded(self, t0: float, t1: float) -> float:
+        """Seconds recorded between t0 and t1, over all recorders."""
+        total = 0.0
+        for r in self.recorders:
+            a, b = max(t0, r.started_at), min(t1, r.stopped_at or now())
+            total += max(0.0, b - a)
+        return total
+
     def start(self) -> dict:
+        log("action start", recording=self.recording, screen=self.screen and self.screen["label"])
+        while self.restarting:
+            time.sleep(0.05)
         with self.lock:
             if self.recording:
                 return self.state()
             if not self.screen:
                 self.status = "No screen selected · pick one to record"
                 return {"ok": False, "error": "no screen selected"}
-            seg = Segment(self.screen, default_audio_device())
-            seg.start()
-            self.seg = seg
+            fresh = not self.has_unsent()
+            rec = Recorder(self.screen, default_audio_device())
+            rec.start()
+            self.rec = rec
+            self.recorders.append(rec)
             self.recording = True
-            if self.rec_since is None:
-                self.rec_since = seg.clip_from
+            self.restarts = 0
+            if fresh or self.rec_since is None:
+                self.rec_since = rec.started_at
             if self.auto:
                 self.next_auto = now() + self.auto
-            self.status = f"Recording {self.screen['label']} · mic: {seg.audio}"
+            self.status = f"Recording {self.screen['label']} · mic: {rec.audio}"
         return self.state()
 
     def stop(self) -> dict:
-        while self.sending:
+        log("action stop (pause)", recording=self.recording)
+        while self.restarting:
             time.sleep(0.05)
         with self.lock:
             if not self.recording:
                 return self.state()
-            seg, self.seg, self.recording, self.next_auto = self.seg, None, False, None
-        seg.stop()
+            rec, self.rec, self.recording, self.next_auto = self.rec, None, False, None
+        rec.stop()
         with self.lock:
-            self.pending.append(seg)
             self.status = "Paused"
         return self.state()
 
@@ -265,34 +542,26 @@ class Controller:
 
     def unsent_seconds(self) -> float:
         """Recorded (not wall-clock) seconds not yet sent; does not grow while paused."""
-        t = sum((s.clip_to or now()) - s.clip_from for s in self.pending)
-        if self.recording and self.seg:
-            t += max(0.0, now() - self.seg.clip_from)
-        return t
+        return self._recorded(self.rec_since, now()) if self.rec_since is not None else 0.0
 
     def has_unsent(self) -> bool:
-        return bool(self.recording or self.pending)
+        return bool(self.recording or self.unsent_seconds() > 0.3)
+
+    def paused_with_unsent(self) -> bool:
+        return not self.recording and self.unsent_seconds() > 0.3
 
     def discard(self) -> dict:
-        """Throw away everything not yet sent; keeps recording if it was on."""
-        while self.sending:
-            time.sleep(0.05)
+        """Throw away everything not yet sent; a running recording keeps running."""
+        log("action discard", recording=self.recording, unsent=self.unsent_seconds())
         with self.lock:
-            old, pend, self.pending = None, self.pending, []
-            if self.recording and self.seg:
-                old = self.seg
-                self.seg = Segment(self.screen or old.screen, default_audio_device())
-                self.seg.start()
-            self.rec_since = self.seg.clip_from if (self.recording and self.seg) else None
+            t = now()
+            self.rec_since = t
             self.samples.clear()
             if self.auto and self.recording:
                 self.next_auto = now() + self.auto
+            # the worker deletes the chunks once the batches queued before are done with them
+            self.jobs.put({"discard_until": t})
             self.status = "Unsent content discarded"
-        if old:
-            old.stop()
-            old.discard()
-        for sg in pend:
-            sg.discard()
         return self.state()
 
     def update_screens(self, screens: list[dict]) -> None:
@@ -305,6 +574,7 @@ class Controller:
     def select_screen(self, which: str | int) -> dict:
         """Select by list position (1-based), display id, or (part of) the name; "none" = no screen."""
         w = str(which).strip()
+        log("action select screen", which=w, recording=self.recording)
         if w.lower() in ("none", "0", "off", "no", "-"):
             if self.recording:
                 self.stop()
@@ -332,35 +602,84 @@ class Controller:
                 (HOME / "state.json").write_text(json.dumps({"screen_id": scr["id"]}))
             except OSError:
                 pass
-            switch = self.recording and self.seg and self.seg.screen["id"] != scr["id"]
+            switch = self.recording and self.rec and self.rec.screen["id"] != scr["id"]
         if switch:
-            self._rotate()
+            self._replace_recorder("screen switch")
         with self.lock:
             self.status = (f"Recording {scr['label']}" if self.recording
                            else f"Will record {scr['label']}")
         return self.state()
 
-    def _rotate(self) -> None:
-        """Move the running recording to the selected screen; what was recorded stays unsent."""
-        while self.sending:
-            time.sleep(0.05)
+    def _replace_recorder(self, reason: str) -> None:
+        """Stop the running recorder, then start a new one on the selected screen (screen switch, or the
+        watchdog found it dead or stalled). What the old one recorded stays and is sent with the batch."""
         with self.lock:
-            if not (self.recording and self.seg):
+            old = self.rec
+            if not (self.recording and old) or self.restarting:
                 return
-            self.sending = True
-            old = self.seg
-            new = Segment(self.screen, default_audio_device())
-            new.start()
-            self.seg = new
+            self.restarting = True
+        log("recorder replace", reason=reason, old=old.name)
         try:
-            time.sleep(CUT_OVERLAP)
-            new.clip_from = old.stop()
+            old.stop()
             with self.lock:
-                self.pending.append(old)
+                if not self.recording or self.rec is not old:
+                    return
+                if not self.screen:
+                    self.recording, self.rec, self.next_auto = False, None, None
+                    self.status = "Screen gone · recording paused"
+                    return
+                new = Recorder(self.screen, default_audio_device())
+                new.start()
+                # recording was meant to go on while the old one was being stopped: count that as its
+                # span, so a recorder that had to be killed shows up as a gap, not as a pause
+                old.stopped_at = new.started_at
+                self.rec = new
+                self.recorders.append(new)
+        except Exception as e:  # noqa: BLE001
+            log_exc("recorder replace failed, recording stopped", e)
+            with self.lock:
+                self.recording, self.rec, self.next_auto = False, None, None
+                self.status = f"Recorder failed to start · see {LOG}"[:140]
+            emit({"error": f"recorder failed to start, recording stopped: {e}", "t": now()})
         finally:
-            self.sending = False
+            self.restarting = False
+
+    def _watch(self) -> None:
+        """Watchdog: a recorder that exited or has written no chunk for STALL_SECONDS is replaced at once.
+        After MAX_RESTARTS failures in a row recording stops and Claude gets an error event."""
+        with self.lock:
+            rec = self.rec
+            if not (self.recording and rec) or self.restarting:
+                return
+        dead = not rec.alive()
+        frames = rec.frames_captured()
+        if frames > rec.seen_frames:  # still capturing: never kill a recorder that makes progress
+            rec.seen_frames, rec.grew_at = frames, now()
+        idle = now() - rec.grew_at
+        if not dead and idle < STALL_SECONDS:
+            if frames and not rec.chunks() and now() - rec.started_at > 4 * CHUNK_SECONDS and not rec.warned:
+                rec.warned = True  # captures, but finishes no chunk: batches fall back to the unfinished file
+                log("recorder captures but finishes no chunk", rec=rec.name, frames=frames, ffmpeg=rec.log_tail())
+            if rec.chunks():
+                self.restarts = 0
+            return
+        self.restarts += 1
+        why = (f"recorder exited ({rec.proc.returncode if rec.proc else '-'}): {rec.log_tail()}" if dead
+               else f"captured no frame for {idle:.0f}s")
+        log("watchdog", problem=why, rec=rec.name, attempt=self.restarts)
+        if self.restarts > MAX_RESTARTS:
+            with self.lock:
+                self.recording, self.rec, self.next_auto = False, None, None
+                self.status = f"Recorder keeps failing, recording stopped · see {LOG}"[:140]
+            threading.Thread(target=rec.stop, daemon=True, name="stop-failed").start()
+            emit({"error": f"recorder failed {MAX_RESTARTS} times in a row, recording stopped: {why}",
+                  "t": now()})
+            return
+        self.status = f"Recorder restarted: {why}"[:140]
+        threading.Thread(target=self._replace_recorder, args=(why,), daemon=True, name="watchdog").start()
 
     def set_auto(self, seconds: int) -> dict:
+        log("action auto-send", seconds=seconds)
         with self.lock:
             self.auto = max(0, int(seconds))
             self.next_auto = now() + self.auto if (self.auto and self.recording) else None
@@ -370,69 +689,64 @@ class Controller:
         i = AUTO_STEPS.index(self.auto) if self.auto in AUTO_STEPS else 0
         self.set_auto(AUTO_STEPS[(i + 1) % len(AUTO_STEPS)])
 
+    def _queue(self, t0: float, t1: float, manual: bool, samples: list, apps: list,
+               recovered: bool = False) -> int:
+        """Queue the batch t0..t1 for the worker (caller holds the lock). Recorders are not touched."""
+        no = self.batch_no
+        self.batch_no += 1
+        entry = {"batch": no, "sent_at": now(), "auto": not manual, "state": "processing",
+                 "seconds": round(self._recorded(t0, t1), 1)}
+        self.history.appendleft(entry)
+        recs = [r for r in self.recorders if r.started_at < t1 and (r.stopped_at or now()) > t0]
+        self.jobs.put(dict(no=no, t0=t0, t1=t1, recs=recs, samples=samples, apps=apps, manual=manual,
+                           recovered=recovered, entry=entry))
+        log("batch queued", batch=no, t0=t0, t1=t1, recorders=",".join(r.name for r in recs) or "none",
+            seconds=entry["seconds"], samples=len(samples), recovered=recovered)
+        return no
+
     def send(self, manual: bool = True) -> dict:
+        """Cut a batch at now. Only bookkeeping: the recorder keeps running, the worker collects the
+        chunks, so nothing here can lose recorded content."""
+        log("action send", manual=manual, recording=self.recording, unsent=self.unsent_seconds())
         with self.lock:
-            if self.sending:
-                return {"ok": False, "error": "already sending"}
-            if not self.recording and not self.pending:
+            if not self.has_unsent():
                 self.status = "Nothing to send"
                 return {"ok": False, "error": "nothing recorded"}
-            self.sending = True
-            old = new = None
-            if self.recording:
-                old = self.seg
-                new = Segment(self.screen or old.screen, default_audio_device())
-                new.start()
-                self.seg = new
-            self.status = "Cutting batch…"
-        try:
-            cut = None
-            if old:
-                time.sleep(CUT_OVERLAP)  # new recorder is warming up; old one still covers
-                cut = old.stop()
-                new.clip_from = cut
-            with self.lock:
-                segs = sorted(self.pending + ([old] if old else []), key=lambda s: s.clip_from)
-                self.pending = []
-                t0 = self.rec_since or segs[0].clip_from
-                t1 = cut or segs[-1].clip_to
-                self.rec_since = cut if self.recording else None
-                samples = [s for s in self.samples if t0 - 1 <= s[0] <= t1 + 1]
-                apps = list(self.apps)
-                keep_from = (cut or t1) - 2
-                while self.samples and self.samples[0][0] < keep_from:
-                    self.samples.popleft()
-                no = self.batch_no
-                self.batch_no += 1
-                entry = {"batch": no, "sent_at": now(), "auto": not manual, "state": "processing",
-                         "seconds": round(sum((g.clip_to or now()) - g.clip_from for g in segs), 1)}
-                self.history.appendleft(entry)
-                if self.auto and self.recording:
-                    self.next_auto = now() + self.auto
-                self.status = f"Batch {no}: processing…"
-            self.jobs.put(dict(no=no, segs=segs, t0=t0, t1=t1, samples=samples, apps=apps,
-                               manual=manual, widget=self.widget_frame, entry=entry))
-            return {"ok": True, "batch": no}
-        finally:
-            self.sending = False
+            t1 = now()
+            t0 = self.rec_since if self.rec_since is not None else t1
+            self.rec_since = t1
+            samples = [s for s in self.samples if t0 - 1 <= s[0] <= t1 + 1]
+            while self.samples and self.samples[0][0] < t1 - 2:
+                self.samples.popleft()
+            no = self._queue(t0, t1, manual, samples=samples, apps=list(self.apps))
+            if self.auto and self.recording:
+                self.next_auto = now() + self.auto
+            self.status = f"Batch {no}: processing…"
+        return {"ok": True, "batch": no}
 
-    def recorder_died(self) -> None:
+    def retry(self, no: int) -> dict:
+        """Process a failed batch again from the raw video and job it kept."""
+        log("action retry", batch=no)
+        d = next(iter(sorted(BATCHES.glob(f"{int(no):04d}-*"))), None)
+        if not d or not (d / "job.json").exists():
+            return {"ok": False, "error": f"batch {no} has nothing to retry (no job.json)"}
+        job = json.loads((d / "job.json").read_text())
+        missing = [c["path"] for p in job["parts"] for c in p["chunks"] if not Path(c["path"]).exists()]
+        if missing:
+            return {"ok": False, "error": f"batch {no}: {len(missing)} raw chunks missing"}
         with self.lock:
-            seg = self.seg
-            if not (self.recording and seg and seg.proc and seg.proc.poll() is not None):
-                return
-            if self.sending:
-                return
-            self.recording, self.seg, self.next_auto = False, None, None
-            msg = seg.log_tail() or f"ffmpeg exited with {seg.proc.returncode}"
-            self.status = f"Recorder failed: {msg[:120]}"
-        emit({"error": f"recorder stopped: {msg}", "t": now()})
-        seg.discard()
+            entry = {"batch": no, "sent_at": now(), "auto": False, "state": "processing",
+                     "seconds": round(job["t1"] - job["t0"], 1)}
+            self.history.appendleft(entry)
+            job.update(entry=entry, retry=True, dir=str(d))
+            self.jobs.put(job)
+            self.status = f"Batch {no}: retrying…"
+        return {"ok": True, "batch": no}
 
     # -- sampling (called from the UI thread at ~30 Hz) ------------------------------------
 
     def sample(self, t, x, y, buttons, in_widget, app) -> None:
-        if not (self.recording or self.sending):
+        if not self.recording:
             return
         self.samples.append((t, x, y, buttons, in_widget))
         if not self.apps or self.apps[-1][1] != app:
@@ -441,35 +755,94 @@ class Controller:
                 self.apps.popleft()
 
     def tick(self) -> None:
-        self.recorder_died()
-        if self.auto and self.recording and self.next_auto and now() >= self.next_auto and not self.sending:
-            self.next_auto = now() + self.auto
-            threading.Thread(target=self.send, kwargs={"manual": False}, daemon=True).start()
+        t = now()
+        if t >= self.next_watch:
+            self.next_watch = t + 1.0
+            self._watch()
+        if self.auto and self.recording and self.next_auto and t >= self.next_auto:
+            self.next_auto = t + self.auto
+            threading.Thread(target=self.send, kwargs={"manual": False}, daemon=True, name="auto-send").start()
 
     # -- processing -----------------------------------------------------------------------
+
+    def _parts(self, job: dict) -> list[dict]:
+        """The chunks each recorder has for t0..t1. Waits until a running recorder has finished the chunk
+        that covers t1 (at most CHUNK_SECONDS plus encoding), or gives up after STALL_SECONDS and reports
+        the rest as a gap."""
+        t0, t1 = job["t0"], job["t1"]
+        deadline = now() + STALL_SECONDS + CHUNK_SECONDS
+        for r in job["recs"]:
+            target = min(t1, r.stopped_at or t1)  # a paused recorder finishes its last chunk on stopping
+            while r.alive() and now() < deadline:
+                ch = r.chunks()
+                if ch and ch[-1]["end"] >= target - 0.05:
+                    break
+                time.sleep(0.2)
+        parts = []
+        for r in job["recs"]:
+            chunks = [c for c in r.chunks(partial=True) if c["end"] > t0 and c["start"] < t1]
+            if any(c.get("partial") for c in chunks):
+                log("using unfinished chunk", rec=r.name, alive=r.alive())
+            expect = [max(t0, r.started_at), min(t1, r.stopped_at or t1)]
+            parts.append({"rec": r.name, "screen": r.screen, "audio": r.audio, "chunks": chunks,
+                          "expected": expect})
+        return parts
+
+    def _consume(self, t: float) -> None:
+        """Content up to t is in processed batches (or discarded): delete its chunks and finished recorders."""
+        consumed = max(read_consumed(), t)
+        write_consumed(consumed)
+        with self.lock:
+            for r in list(self.recorders):
+                n = r.delete_chunks_until(consumed)
+                if (r is not self.rec and not r.alive() and (r.stopped_at or 0) <= consumed + 0.01
+                        and not any(r.dir.glob("chunk-*.mkv"))):
+                    shutil.rmtree(r.dir, ignore_errors=True)
+                    self.recorders.remove(r)
+                    log("recorder folder removed", rec=r.name)
+                elif n:
+                    log("chunks deleted", rec=r.name, count=n)
 
     def _worker(self) -> None:
         while True:
             job = self.jobs.get()
+            if "discard_until" in job:
+                log("discard applied", until=job["discard_until"])
+                self._consume(job["discard_until"])
+                continue
             self.busy += 1
+            log("batch processing", batch=job["no"])
+            d = Path(job["dir"]) if job.get("dir") else (
+                BATCHES / f"{job['no']:04d}-{time.strftime('%Y%m%d-%H%M%S', time.localtime(job['t0']))}")
             try:
-                result = process_batch(job)
+                d.mkdir(parents=True, exist_ok=True)
+                if "parts" not in job:
+                    job["parts"] = self._parts(job)
+                save_job(job, d)
+                result = process_batch(job, d)
+                log("batch done", batch=job["no"], skipped=bool(result.get("skipped")),
+                    moments=result.get("moments"))
                 with self.lock:
                     self.last_batch = result
                     if result.get("skipped"):
                         job["entry"]["state"] = "skipped (nothing said)"
                         self.status = f"Batch {job['no']}: nothing said, skipped"
                     else:
-                        job["entry"]["state"] = f"→ Claude · {result['moments']} moments"
-                        self.status = f"Batch {job['no']} → Claude ({result['moments']} moments)"
+                        shots = f"{result['moments']} screenshot{'' if result['moments'] == 1 else 's'}"
+                        job["entry"]["state"] = f"→ Claude · {shots}"
+                        self.status = f"Batch {job['no']} → Claude ({shots})"
+                if not job.get("retry"):
+                    self._consume(job["t1"])
             except Exception as e:  # noqa: BLE001
-                emit({"batch": job["no"], "error": f"{type(e).__name__}: {e}", "t": now()})
+                log_exc("batch processing failed", e, batch=job["no"])
+                kept = keep_raw(job, d)
+                hint = f"; raw video kept, retry with: screenfeed retry {job['no']}" if kept else ""
+                emit({"batch": job["no"], "error": f"{type(e).__name__}: {e}{hint}", "t": now()})
                 job["entry"]["state"] = "failed"
                 self.status = f"Batch {job['no']} failed: {e}"[:140]
+                if kept and not job.get("retry"):
+                    self._consume(job["t1"])
             finally:
-                if not KEEP_VIDEO:
-                    for s in job["segs"]:
-                        s.discard()
                 self.busy -= 1
 
     def state(self) -> dict:
@@ -477,33 +850,97 @@ class Controller:
         return {
             "ok": True,
             "recording": self.recording,
-            "paused_with_unsent": bool(not self.recording and self.pending),
+            "paused_with_unsent": self.paused_with_unsent(),
             "unsent_seconds": round(self.unsent_seconds(), 1),
             "auto_seconds": self.auto,
             "next_auto_in": round(self.next_auto - t, 1) if self.next_auto else None,
             "sending": self.sending,
+            "restarting": self.restarting,
             "processing": self.busy + self.jobs.qsize(),
             "next_batch": self.batch_no,
             "screen": self.screen and self.screen["label"],
-            "recording_screen": self.seg.screen["label"] if (self.recording and self.seg) else None,
+            "recording_screen": self.rec.screen["label"] if (self.recording and self.rec) else None,
+            "recorder": self.rec.name if self.rec else None,
             "screens": [f"{i}: {s['label']}" for i, s in enumerate(self.screens, 1)],
             "status": self.status,
             "claude_msg": self.claude_msg,
+            "claude_msg_ago": fmt_ago(self.claude_msg_at) if self.claude_msg_at else None,
             "last_batch": self.last_batch,
             "build": BUILD,
-            "history": [dict(h, sent_at=time.strftime("%H:%M:%S", time.localtime(h["sent_at"])))
+            "log": str(LOG),
+            "languages": languages() or "auto",
+            "history": [dict(h, sent_at=time.strftime("%H:%M:%S", time.localtime(h["sent_at"])),
+                             sent_ago=fmt_ago(h["sent_at"]))
                         for h in self.history],
         }
 
     def shutdown(self) -> None:
+        """Stop recording. Unsent content stays on disk and is sent as a recovered batch on next launch."""
+        log("shutdown", recording=self.recording, unsent=self.unsent_seconds())
         with self.lock:
-            seg, self.seg, self.recording = self.seg, None, False
-            pend, self.pending = self.pending, []
-        if seg:
-            seg.stop()
-            seg.discard()
-        for s in pend:
-            s.discard()
+            rec, self.rec, self.recording = self.rec, None, False
+        if rec:
+            rec.stop()
+
+
+def save_job(job: dict, d: Path) -> None:
+    """What a batch is made of, so that it can be processed again (screenfeed retry)."""
+    keep = {k: job[k] for k in ("no", "t0", "t1", "samples", "apps", "manual", "recovered", "parts") if k in job}
+    (d / "job.json").write_text(json.dumps(keep, ensure_ascii=False))
+
+
+def keep_raw(job: dict, d: Path) -> bool:
+    """After a failure: copy the batch's chunks into the batch folder, so they survive the cleanup."""
+    try:
+        if "parts" not in job:
+            return False
+        raw = d / "raw"
+        raw.mkdir(parents=True, exist_ok=True)
+        for part in job["parts"]:
+            for c in part["chunks"]:
+                src = Path(c["path"])
+                dst = raw / f"{part['rec']}-{src.name}"
+                if src != dst and src.exists():
+                    shutil.copy2(src, dst)
+                c["path"] = str(dst)
+        save_job(job, d)
+        log("raw video kept for retry", batch=job["no"], dir=str(raw))
+        return True
+    except Exception as e:  # noqa: BLE001
+        log_exc("keeping raw video failed", e, batch=job.get("no"))
+        return False
+
+
+def join_chunks(part: dict, t0: float, t1: float, work: Path, i: int) -> Clip | None:
+    """One file from a recorder's chunks (stream copy), with the wall-clock time it starts at."""
+    chunks = [c for c in part["chunks"] if Path(c["path"]).exists()]
+    if not chunks:
+        return None
+    lst = work / f"chunks-{i}.txt"
+    lst.write_text("".join(f"file '{c['path']}'\n" for c in chunks))
+    out = work / f"clip-{i}.mkv"
+    subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
+                    "-i", str(lst), "-c", "copy", str(out)], check=True)
+    start = chunks[0]["start"]
+    duration = probe_duration(out)
+    log("chunks joined", rec=part["rec"], chunks=len(chunks), duration=duration)
+    # the span recorded is what the chunks cover in wall-clock time; an unfinished chunk can have broken
+    # packet times, so the file may be shorter (frames and audio offsets are clamped to it)
+    return Clip(out, part["screen"], part["audio"], start, duration,
+                max(t0, start), min(t1, max(start + duration, chunks[-1]["end"])))
+
+
+def gaps_of(part: dict, min_len: float = 2.5) -> list[tuple[float, float]]:
+    """Stretches the recorder should have covered but has no chunk for (stall, crash, killed recorder)."""
+    a, b = part["expected"]
+    out, at = [], a
+    for c in sorted(part["chunks"], key=lambda c: c["start"]):
+        if c["start"] - at >= min_len:
+            out.append((at, c["start"]))
+        at = max(at, c["end"])
+    if b - at >= min_len:
+        out.append((at, b))
+    return out
 
 
 # --------------------------------------------------------------------------------------------
@@ -525,7 +962,9 @@ def is_junk(text: str) -> bool:
     low = re.sub(r"[^\w\s]", "", t.lower()).strip()
     if low in HALLUCINATIONS:
         return True
-    return any(k in low for k in ("untertitel", "amaraorg", "zdf", "subtitles by"))
+    # "ご視聴ありがとうございました" = "thanks for watching": whisper's favourite invention on near-silence
+    return any(k in low for k in ("untertitel", "amaraorg", "zdf", "subtitles by", "ご視聴ありがとうございました",
+                                     "субтитр", "dimatorzok"))  # Russian subtitle credits, likewise invented
 
 
 def max_volume(wav: Path) -> float:
@@ -535,19 +974,53 @@ def max_volume(wav: Path) -> float:
     return float(m.group(1)) if m else -91.0
 
 
-def transcribe(seg: Segment, a: float, b: float, workdir: Path, i: int) -> tuple[list, str | None]:
+CONFIG = HOME / "config.json"
+_last_language: str | None = None  # the language of the last transcript, the fallback for the next one
+
+
+def languages() -> list[str]:
+    """The languages whisper may pick from; empty means any. `screenfeed languages` sets them (config.json,
+    read on every batch), else SCREENFEED_LANG or SCREENFEED_LANGUAGES."""
+    try:
+        value = json.loads(CONFIG.read_text()).get("languages")
+    except (OSError, ValueError):
+        value = None
+    if value is None:
+        value = LANG if LANG != "auto" else DEFAULT_LANGUAGES
+    value = str(value).strip().lower()
+    return [] if value in ("", "auto", "any") else [x.strip() for x in value.split(",") if x.strip()]
+
+
+def run_whisper(wav: Path, out: Path, lang: str) -> dict:
+    subprocess.run([WHISPER, "-m", MODEL, "-l", lang, "-oj", "-of", str(out), "-np", "-ml", "90",
+                    "-sow", "-sns", "-f", str(wav)], capture_output=True, check=True, timeout=900)
+    return json.loads(out.with_suffix(".json").read_text(errors="replace"))
+
+
+def transcribe(seg: Clip, a: float, b: float, workdir: Path, i: int) -> tuple[list, str | None]:
     if seg.audio == "none":
         return [], None
     wav = workdir / f"audio-{i}.wav"
     subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{a:.3f}",
                     "-t", f"{b - a:.3f}", "-i", str(seg.path), "-vn", "-ar", "16000", "-ac", "1",
                     str(wav)], check=True)
-    if max_volume(wav) < -42:
+    vol = max_volume(wav)
+    log("transcribe", seg=seg.path.name, start=a, end=b, max_volume_db=vol)
+    if vol < -42:
+        log("transcribe skipped: too quiet", seg=seg.path.name)
         return [], None
+    global _last_language
     out = workdir / f"speech-{i}"
-    subprocess.run([WHISPER, "-m", MODEL, "-l", LANG, "-oj", "-of", str(out), "-np", "-ml", "90",
-                    "-sow", "-sns", "-f", str(wav)], capture_output=True, check=True, timeout=900)
-    data = json.loads(out.with_suffix(".json").read_text(errors="replace"))
+    allowed = languages()
+    data = run_whisper(wav, out, allowed[0] if len(allowed) == 1 else "auto")
+    detected = data.get("result", {}).get("language")
+    if len(allowed) > 1 and detected not in allowed:
+        # whisper heard another language: on near-silence it invents Russian or Japanese subtitle credits
+        fallback = _last_language if _last_language in allowed else allowed[0]
+        log("transcribe: language not allowed, again", detected=detected, allowed=",".join(allowed), using=fallback)
+        data = run_whisper(wav, out, fallback)
+        data.setdefault("result", {})["language"] = fallback
+    _last_language = data.get("result", {}).get("language") or _last_language
     base = seg.actual_start + a
     res = []
     for s in data.get("transcription", []):
@@ -597,14 +1070,14 @@ def app_at(apps: list, t: float) -> str:
     return name or (apps[0][1] if apps else "")
 
 
-def seg_for(segs: list, t: float) -> Segment:
+def seg_for(segs: list, t: float) -> Clip:
     for s in segs:
         if s.clip_from - 0.05 <= t <= (s.clip_to or 0) + 0.05:
             return s
     return min(segs, key=lambda s: min(abs(t - s.clip_from), abs(t - (s.clip_to or s.clip_from))))
 
 
-def render_frame(seg: Segment, t: float, x: float, y: float, base: Path) -> dict:
+def render_frame(seg: Clip, t: float, x: float, y: float, base: Path) -> dict:
     from PIL import Image, ImageDraw
 
     off = min(max(t - seg.actual_start, 0), max(seg.duration - 0.15, 0))
@@ -636,14 +1109,25 @@ def render_frame(seg: Segment, t: float, x: float, y: float, base: Path) -> dict
     return out
 
 
-def process_batch(job: dict) -> dict:
-    no, segs, t0, t1 = job["no"], job["segs"], job["t0"], job["t1"]
+def process_batch(job: dict, d: Path) -> dict:
+    no, t0, t1 = job["no"], job["t0"], job["t1"]
     samples, apps = job["samples"], job["apps"]
-    d = BATCHES / f"{no:04d}-{time.strftime('%Y%m%d-%H%M%S', time.localtime(t0))}"
     frames = d / "frames"
     frames.mkdir(parents=True, exist_ok=True)
     work = d / "work"
     work.mkdir(exist_ok=True)
+
+    # 0. the recorded video: one clip per recorder, joined from its chunks; and what is missing
+    segs = [c for i, part in enumerate(job["parts"]) if (c := join_chunks(part, t0, t1, work, i))]
+    gaps = sorted(g for part in job["parts"] for g in gaps_of(part))
+    if gaps:
+        log("recording gaps", batch=no, gaps=" ".join(f"{a - t0:.1f}-{b - t0:.1f}s" for a, b in gaps))
+    if not segs:
+        if not job["manual"]:
+            shutil.rmtree(d, ignore_errors=True)
+            emit({"batch": no, "skipped": "nothing recorded", "t": now()})
+            return {"batch": no, "skipped": True, "moments": 0}
+        raise RuntimeError("no recorded video for this batch (recorder produced no chunks)")
 
     # 1. transcript (wall-clock timestamps)
     speech, lang = [], None
@@ -658,6 +1142,8 @@ def process_batch(job: dict) -> dict:
         speech += res
         lang = lang or l
     speech.sort()
+    log("transcript", batch=no, sentences=len(speech), lang=lang,
+        segs=" ".join(f"{s.path.name}:{s.duration:.1f}s" for s in segs))
 
     if not speech and not job["manual"]:
         shutil.rmtree(d, ignore_errors=True)
@@ -690,8 +1176,8 @@ def process_batch(job: dict) -> dict:
     for c in clicks:
         if c[0] not in used_clicks:
             moments.append(dict(t=c[0], x=c[1], y=c[2], kind="click", speech=None, dwell=0))
-    end = cursor_at(samples, t1 - CUT_OVERLAP - 0.2)
-    end_t = max(t0, t1 - CUT_OVERLAP - 0.2)
+    end = cursor_at(samples, t1 - END_MARGIN)
+    end_t = max(t0, t1 - END_MARGIN)
 
     spoken = [m for m in moments if m["speech"] is not None]
     other = sorted([m for m in moments if m["speech"] is None], key=lambda m: m["t"])
@@ -735,17 +1221,22 @@ def process_batch(job: dict) -> dict:
         "",
         f"- Recorded {time.strftime('%H:%M:%S', time.localtime(t0))} to "
         f"{time.strftime('%H:%M:%S', time.localtime(t1))} ({int(rec_s)} s recorded"
-        + (", paused in between; timestamps are wall-clock since start)" if t1 - t0 > rec_s + 3 else ")"),
+        + (", paused in between; timestamps are wall-clock since start)"
+           if t1 - t0 > rec_s + sum(b - a for a, b in gaps) + 3 else ")"),
         f"- Screen: {', '.join(dict.fromkeys(s.screen['label'] for s in segs))}, "
         f"spoken language: {lang or 'n/a'}",
         "- Images: `full` = whole screen, `zoom` = crop around the cursor. The red ring marks the "
         "mouse cursor at the moment the sentence was spoken (where the user was pointing). "
         "Coordinates are points from the top-left of the screen. A red frame or REC badge at the "
         "screen edges, if visible, is the recording indicator; ignore it.",
-        "",
-        "## Timeline",
-        "",
     ]
+    if gaps:
+        out.append("- Recording gaps (the recorder failed and was restarted; anything said then is missing): "
+                   + ", ".join(f"{fmt_dur(a - t0)}–{fmt_dur(b - t0)}" for a, b in gaps))
+    if job.get("recovered"):
+        out.append("- Recovered: recorded in an earlier screenfeed run that ended before this was sent "
+                   "(crash or quit). Cursor data was not kept, so there are no pointing frames.")
+    out += ["", "## Timeline", ""]
     by_speech: dict[int, list] = {}
     for m in rendered:
         if m["speech"] is not None:
@@ -766,11 +1257,16 @@ def process_batch(job: dict) -> dict:
     out += ["", "## Full transcript", "", " ".join(s[2] for s in speech) or "_(none)_", ""]
     timeline = d / "timeline.md"
     timeline.write_text("\n".join(out))
+    if KEEP_VIDEO:
+        for c in segs:
+            shutil.move(str(c.path), str(d / c.path.name))
     shutil.rmtree(work, ignore_errors=True)
+    if not KEEP_VIDEO:
+        shutil.rmtree(d / "raw", ignore_errors=True)  # kept after an earlier failure; processed now
 
     preview = " ".join(s[2] for s in speech)
     event = {"batch": no, "dir": str(d), "timeline": str(timeline), "seconds": int(rec_s),
-             "moments": len(rendered), "speech": preview[:200], "t": now()}
+             "moments": len(rendered), "speech": preview[:200], "gaps": len(gaps), "t": now()}
     emit(event)
     return event
 
@@ -782,12 +1278,15 @@ def process_batch(job: dict) -> dict:
 
 def run_app() -> None:
     import AppKit as K
+    import objc
     import Quartz
     from PyObjCTools import AppHelper
 
     HOME.mkdir(parents=True, exist_ok=True)
-    shutil.rmtree(RAW, ignore_errors=True)
-    ctl = Controller()
+    threading.excepthook = _log_uncaught
+    leftovers = sorted(p.name for p in RAW.glob("*")) if RAW.exists() else []
+    log("app starting", pid=os.getpid(), leftover_raw=",".join(leftovers) or "none")
+    ctl = Controller()  # recovers what an earlier run left in RAW; never wipe it here
 
     def screen_info(s) -> dict:
         did = int(s.deviceDescription()["NSScreenNumber"])
@@ -879,11 +1378,11 @@ def run_app() -> None:
 
     def sync_overlays(widget_panel):
         flashing = now() < ctl.flash_until
-        if ctl.recording and ctl.seg:
-            target, mode = ctl.seg.screen, "rec"
+        if ctl.recording and ctl.rec:
+            target, mode = ctl.rec.screen, "rec"
         elif ctl.screen:  # always show where Rec will record while the app runs
             target = ctl.screen
-            mode = "flash" if flashing else ("paused" if ctl.pending else "ready")
+            mode = "flash" if flashing else ("paused" if ctl.paused_with_unsent() else "ready")
         else:
             target, mode = None, None
         screens = list(K.NSScreen.screens())
@@ -1098,20 +1597,25 @@ def run_app() -> None:
                                     "Quit screenfeed")
             self.quit_armed = 0.0
             self.n = 0
+            self.acting = None  # (button, title) while a clicked action runs: shown at once
+            self.fast_until = 0.0  # refresh at full rate until then (right after a click)
+            self.slow_logged = 0.0
             p.orderFrontRegardless()
             p.invalidateShadow()
             return self
 
         # -- actions ---------------------------------------------------------------------------
         def onRec_(self, sender):
+            log("ui click: record/pause", enabled=getattr(sender, "sf_enabled", True))
             if not getattr(sender, "sf_enabled", True):
                 return
-            threading.Thread(target=ctl.toggle, daemon=True).start()
+            self.act(self.rec, "Pausing…" if ctl.recording else "Starting…", ctl.toggle)
 
         def onSend_(self, sender):
+            log("ui click: send", enabled=getattr(sender, "sf_enabled", True))
             if not getattr(sender, "sf_enabled", True):
                 return
-            threading.Thread(target=ctl.send, kwargs={"manual": True}, daemon=True).start()
+            self.act(self.send, "Sending…", lambda: ctl.send(manual=True))
 
         def onAuto_(self, sender):
             i = int(sender.indexOfSelectedItem())
@@ -1123,18 +1627,40 @@ def run_app() -> None:
             threading.Thread(target=ctl.select_screen, args=(pos or "none",), daemon=True).start()
 
         def onQuit_(self, sender):
+            log("ui click: quit", unsent=ctl.has_unsent())
             # with unsent content, ask for a second click within 3 s
             if ctl.has_unsent() and now() > self.quit_armed:
                 self.quit_armed = now() + 3
                 self.quit.setContentTintColor_(K.NSColor.systemRedColor())
-                ctl.status = "Click ⏻ again to quit · unsent recording will be lost"
+                ctl.status = "Click ⏻ again to quit · unsent recording is sent on next start"
                 return
             AppHelper.callAfter(shutdown)
 
         def onDiscard_(self, sender):
+            log("ui click: discard", enabled=getattr(sender, "sf_enabled", True))
             if not getattr(sender, "sf_enabled", True):
                 return
-            threading.Thread(target=ctl.discard, daemon=True).start()
+            self.act(self.drop, "Discarding…", ctl.discard)
+
+        @objc.python_method  # a plain Python helper, not an Objective-C selector
+        def act(self, button, title, fn):
+            """Run a clicked action off the main thread, but answer the click at once: the button shows
+            `title` until the action is done, and the widget refreshes at full rate meanwhile."""
+            self.acting = (button, title)
+            self.fast_until = now() + 1.5
+            style_button(button, title, "hourglass", K.NSColor.colorWithWhite_alpha_(0.36, 0.95),
+                         K.NSColor.whiteColor(), False)
+            clicked = now()
+
+            def run():
+                try:
+                    fn()
+                finally:
+                    log("ui action done", action=title, took=now() - clicked)
+                    self.acting = None
+                    self.fast_until = now() + 0.5
+
+            threading.Thread(target=run, daemon=True, name=f"ui:{title}").start()
 
         # -- refresh ---------------------------------------------------------------------------
 
@@ -1170,10 +1696,10 @@ def run_app() -> None:
                        str(app.localizedName()) if app else "")
             ctl.tick()
             self.n += 1
-            if self.n % 6:
+            if self.n % 6 and t > self.fast_until:  # 5 Hz, but 30 Hz right after a click
                 return
             rec = ctl.recording
-            paused = not rec and bool(ctl.pending)
+            paused = ctl.paused_with_unsent()
             sync_overlays(self.panel)
             self.syncPicker()
             if getattr(self, "edge_rec", None) != rec:
@@ -1206,6 +1732,9 @@ def run_app() -> None:
                                blue if can_send else dim_bg, white if can_send else dim_fg, can_send)
             style_button(self.drop, "Discard", "trash", neutral_bg if can_send else dim_bg,
                                white if can_send else dim_fg, can_send)
+            acting = self.acting
+            if acting:  # a clicked action still runs: keep showing that it is under way
+                style_button(acting[0], acting[1], "hourglass", neutral_bg, white, False)
 
             # timer = recorded time not sent yet (frozen while paused)
             self.timer.setStringValue_(fmt_dur(ctl.unsent_seconds()))
@@ -1229,7 +1758,9 @@ def run_app() -> None:
             quiet = ctl.status in ("Ready",) or ctl.status.startswith(("Will record", "Recording "))
             self.stat.setStringValue_(("" if quiet else ctl.status)
                                       + (f" ({busy} processing)" if busy > 1 else ""))
-            self.msg.setStringValue_(ctl.claude_msg or "Waiting for your first batch")
+            self.msg.setStringValue_(f"{fmt_ago(ctl.claude_msg_at)} · {ctl.claude_msg}"
+                                     if ctl.claude_msg and ctl.claude_msg_at else
+                                     ctl.claude_msg or "Waiting for your first batch")
             self.msg.setTextColor_(K.NSColor.labelColor() if ctl.claude_msg else K.NSColor.tertiaryLabelColor())
             self.msg.setToolTip_(ctl.claude_msg)
 
@@ -1237,6 +1768,7 @@ def run_app() -> None:
             for i, (ic, lab) in enumerate(zip(self.hist_icons, self.hist)):
                 if i >= len(hist):
                     ic.setHidden_(True)
+                    lab.sf_text = None
                     lab.setStringValue_("Nothing sent yet" if i == 0 else "")
                     lab.setFrameOrigin_(K.NSMakePoint(12 if i == 0 else 30, lab.frame().origin.y))
                     continue
@@ -1252,11 +1784,29 @@ def run_app() -> None:
                     sym, tint, what = "exclamationmark.triangle.fill", K.NSColor.systemYellowColor(), "failed"
                 ic.setHidden_(False)
                 lab.setFrameOrigin_(K.NSMakePoint(30, lab.frame().origin.y))
-                ic.setImage_(symbol(sym, 11))
-                ic.setContentTintColor_(tint)
-                lab.setStringValue_(f"{time.strftime('%H:%M', time.localtime(h['sent_at']))}  "
-                                    f"#{h['batch']}  {fmt_dur(h['seconds'])}  {what}"
-                                    + ("  · auto" if h["auto"] else ""))
+                if getattr(ic, "sf_sym", None) != sym:  # building symbol images on every refresh is slow
+                    ic.sf_sym = sym
+                    ic.setImage_(symbol(sym, 11))
+                    ic.setContentTintColor_(tint)
+                # columns on tab stops: when (right-aligned), batch number, length, outcome
+                if not hasattr(self, "hist_style"):
+                    self.hist_style = K.NSMutableParagraphStyle.alloc().init()
+                    self.hist_style.setTabStops_([
+                        K.NSTextTab.alloc().initWithTextAlignment_location_options_(align, x, {})
+                        for align, x in ((K.NSTextAlignmentRight, 60), (K.NSTextAlignmentRight, 90),
+                                         (K.NSTextAlignmentRight, 124), (K.NSTextAlignmentLeft, 134))])
+                    self.hist_style.setLineBreakMode_(K.NSLineBreakByTruncatingTail)
+                text = (f"\t{fmt_ago(h['sent_at'])}\t#{h['batch']}\t{fmt_dur(h['seconds'])}\t{what}"
+                        + (" · auto" if h["auto"] else ""))
+                if getattr(lab, "sf_text", None) != text:
+                    lab.sf_text = text
+                    lab.setAttributedStringValue_(K.NSAttributedString.alloc().initWithString_attributes_(text, {
+                        K.NSFontAttributeName: lab.font(), K.NSForegroundColorAttributeName: lab.textColor(),
+                        K.NSParagraphStyleAttributeName: self.hist_style}))
+            took = now() - t
+            if took > 0.05 and t - self.slow_logged > 10:  # a slow refresh delays the next click
+                self.slow_logged = t
+                log("slow ui refresh", ms=round(took * 1000))
 
 
     # -- HTTP API ---------------------------------------------------------------------------
@@ -1292,6 +1842,7 @@ def run_app() -> None:
             q = urllib.parse.parse_qs(u.query)
             n = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(n).decode("utf-8", "replace") if n else ""
+            log("api", path=self.path, body=body[:200])
             try:
                 if u.path == "/screen":
                     return self.reply(ctl.select_screen(q.get("which", [""])[0]))
@@ -1305,16 +1856,20 @@ def run_app() -> None:
                     return self.reply(ctl.toggle())
                 if u.path == "/send":
                     return self.reply(ctl.send(manual=True))
+                if u.path == "/retry":
+                    return self.reply(ctl.retry(int(q.get("batch", ["0"])[0])))
                 if u.path == "/auto":
                     return self.reply(ctl.set_auto(int(q.get("seconds", ["0"])[0])))
                 if u.path == "/say":
                     ctl.claude_msg = body.strip()
+                    ctl.claude_msg_at = now()
                     return self.reply({"ok": True})
                 if u.path == "/quit":
                     self.reply({"ok": True})
                     AppHelper.callAfter(shutdown)
                     return
             except Exception as e:  # noqa: BLE001
+                log_exc("api request failed", e, path=self.path)
                 return self.reply({"ok": False, "error": str(e)}, 500)
             self.reply({"ok": False, "error": "not found"}, 404)
 
@@ -1322,6 +1877,7 @@ def run_app() -> None:
         server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     except OSError:
         print(f"screenfeed already running on port {PORT}", file=sys.stderr)
+        log("app start aborted: port in use", port=PORT)
         sys.exit(1)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
@@ -1344,7 +1900,9 @@ def run_app() -> None:
     K.NSRunLoop.currentRunLoop().addTimer_forMode_(timer, K.NSRunLoopCommonModes)
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: shutdown())
-    print(f"screenfeed running · http://127.0.0.1:{PORT} · data in {HOME}", flush=True)
+    print(f"screenfeed running · http://127.0.0.1:{PORT} · data in {HOME} · log {LOG}", flush=True)
+    log("app started", pid=os.getpid(), build=BUILD, screen=ctl.screen and ctl.screen["label"],
+        audio=default_audio_device())
     app.run()
 
 
@@ -1429,6 +1987,24 @@ def main(argv: list[str]) -> None:
         cmd = {"pause": "stop", "resume": "start"}.get(cmd, cmd)
         if cmd in ("start", "stop", "toggle", "send", "discard"):
             r = api("POST", f"/{cmd}")
+        elif cmd in ("languages", "language", "lang"):
+            if len(argv) > 2:
+                value = argv[2].strip().lower()
+                if value not in ("auto", "any") and not re.fullmatch(r"[a-z]{2,3}(,[a-z]{2,3})*", value.replace(" ", "")):
+                    sys.exit("usage: screenfeed languages <codes, e.g. en,de | auto>")
+                HOME.mkdir(parents=True, exist_ok=True)
+                try:
+                    cfg = json.loads(CONFIG.read_text())
+                except (OSError, ValueError):
+                    cfg = {}
+                cfg["languages"] = value.replace(" ", "")
+                CONFIG.write_text(json.dumps(cfg))
+            print(",".join(languages()) or "auto (any language)")
+            return
+        elif cmd == "retry":
+            if len(argv) < 3 or not argv[2].isdigit():
+                sys.exit("usage: screenfeed retry <batch number>")
+            r = api("POST", f"/retry?batch={int(argv[2])}")
         elif cmd == "auto":
             arg = argv[2] if len(argv) > 2 else "off"
             r = api("POST", f"/auto?seconds={0 if arg == 'off' else int(arg)}")
