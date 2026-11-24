@@ -44,12 +44,15 @@ screenfeed launch
 | **Send ⏎** | Cut the current batch and hand it to Claude |
 | **✕** | Discard everything not sent yet |
 | **Auto** | Send automatically every 30s, 1m, 2m or 5m (batches without speech are skipped) |
-| **Screen** | Which display is recorded; picking one highlights it for 2 seconds |
+| **Screen** | Which display is recorded, or "No screen" to disable recording; remembered across restarts |
+| **Quit** | Exit screenfeed (asks for a second click if there is unsent content) |
 | Unsent line | `● REC 0:42 unsent` or `⏸ PAUSED 0:42 unsent`; counts recorded time only |
 | SENT | The last 4 batches: time, number, length, and whether they reached Claude |
 
-While recording, the recorded display gets a pulsing red frame and a **● REC** badge, and other
-displays show **Not recorded**. The indicator is click-through and kept out of the recording.
+While the app runs, the selected display shows a green frame with a **Ready** badge, so you always
+know which screen Rec will record. While recording, it turns into a pulsing red frame with a
+**● REC** badge, and other displays show **Not recorded**. The frames are click-through and kept
+out of the recording. The widget also shows the build time and git commit of the running version.
 
 ## CLI
 
@@ -60,7 +63,7 @@ screenfeed send                    send the current batch
 screenfeed discard                 throw away unsent content
 screenfeed auto <seconds|off>      periodic sending
 screenfeed screens                 list displays (* = selected)
-screenfeed screen <n|name>         pick the recorded display
+screenfeed screen <n|name|none>    pick the recorded display (none = recording disabled)
 screenfeed say "<text>"            show a message in the widget (used by Claude)
 screenfeed status                  JSON state, including unsent time and history
 screenfeed watch                   one line per ready batch (for Claude Code's Monitor tool)

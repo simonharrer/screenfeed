@@ -22,6 +22,7 @@ Commands:
   screenfeed discard          throw away everything recorded but not sent
   screenfeed screens          list displays (* = selected)
   screenfeed screen <n|name>  record that display (switches immediately when recording)
+  screenfeed screen none      no screen: recording disabled (pauses a running recording)
   screenfeed send             cut the current batch and send it
   screenfeed auto <sec|off>   send automatically every <sec> seconds
   screenfeed say <text>       show a message from Claude in the widget
@@ -233,7 +234,8 @@ class Controller:
             if self.recording:
                 return self.state()
             if not self.screen:
-                return {"ok": False, "error": "screen unknown (UI not ready)"}
+                self.status = "No screen selected · pick one to record"
+                return {"ok": False, "error": "no screen selected"}
             seg = Segment(self.screen, default_audio_device())
             seg.start()
             self.seg = seg
@@ -297,17 +299,25 @@ class Controller:
         """Called by the UI with the current display list; keeps the selection valid."""
         with self.lock:
             self.screens = screens
-            cur = self.screen and next((s for s in screens if s["id"] == self.screen["id"]), None)
-            if cur:
-                self.screen = cur
-            elif screens:
-                self.screen = screens[0]
+            if self.screen:  # selected display unplugged -> no screen (never silently record another)
+                self.screen = next((s for s in screens if s["id"] == self.screen["id"]), None)
 
     def select_screen(self, which: str | int) -> dict:
-        """Select by list position (1-based), display id, or (part of) the name."""
+        """Select by list position (1-based), display id, or (part of) the name; "none" = no screen."""
+        w = str(which).strip()
+        if w.lower() in ("none", "0", "off", "no", "-"):
+            if self.recording:
+                self.stop()
+            with self.lock:
+                self.screen = None
+                self.status = "No screen selected · recording disabled"
+            try:
+                (HOME / "state.json").write_text(json.dumps({"screen_id": None}))
+            except OSError:
+                pass
+            return self.state()
         with self.lock:
             scr = None
-            w = str(which).strip()
             if w.isdigit() and 1 <= int(w) <= len(self.screens):
                 scr = self.screens[int(w) - 1]
             if not scr:
@@ -802,8 +812,9 @@ def run_app() -> None:
     overlays: dict = {"key": None, "wins": []}
 
     def make_overlay(s, mode: str):
-        """mode: "rec" (being recorded), "preview" (selected, not yet recording), "off"."""
-        recorded = mode in ("rec", "preview")
+        """mode: "rec" (being recorded, red pulsing), "ready" / "flash" (green: recorded when you
+        press Rec; "flash" = thicker, right after picking it), "paused" (green), "off" (other screen)."""
+        recorded = mode != "off"
         f, vf = s.frame(), s.visibleFrame()
         w = K.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             f, K.NSWindowStyleMaskBorderless, K.NSBackingStoreBuffered, False)
@@ -826,8 +837,10 @@ def run_app() -> None:
             border = K.NSView.alloc().initWithFrame_(K.NSMakeRect(0, 0, fw, fh))
             border.setWantsLayer_(True)
             layer = border.layer()
-            layer.setBorderWidth_(10)
-            layer.setBorderColor_(red.CGColor())
+            green = K.NSColor.colorWithSRGBRed_green_blue_alpha_(0.13, 0.80, 0.33, 1.0)
+            dark_green = K.NSColor.colorWithSRGBRed_green_blue_alpha_(0.05, 0.50, 0.20, 0.95)
+            layer.setBorderWidth_({"rec": 10, "flash": 10}.get(mode, 6))
+            layer.setBorderColor_((red if mode == "rec" else green).CGColor())
             pulse = Quartz.CABasicAnimation.animationWithKeyPath_("opacity")
             pulse.setFromValue_(1.0)
             pulse.setToValue_(0.35)
@@ -838,9 +851,11 @@ def run_app() -> None:
                 layer.addAnimation_forKey_(pulse, "pulse")
                 text, bg, size = ("●  REC    This screen is being recorded  ·  screen + microphone + cursor",
                                   red, 15)
+            elif mode == "paused":
+                text, bg, size = "⏸  Paused  ·  Resume records this screen", dark_green, 12
             else:
-                text, bg, size = ("This screen will be recorded",
-                                  K.NSColor.colorWithSRGBRed_green_blue_alpha_(0.55, 0.05, 0.05, 0.95), 15)
+                text, bg, size = ("Ready  ·  press Rec to record this screen", dark_green,
+                                  15 if mode == "flash" else 12)
             root.addSubview_(border)
         else:
             text, bg, size = "Not recorded", K.NSColor.colorWithWhite_alpha_(0.25, 0.85), 12
@@ -863,10 +878,12 @@ def run_app() -> None:
         return w
 
     def sync_overlays(widget_panel):
+        flashing = now() < ctl.flash_until
         if ctl.recording and ctl.seg:
             target, mode = ctl.seg.screen, "rec"
-        elif ctl.screen and now() < ctl.flash_until:
-            target, mode = ctl.screen, "preview"
+        elif ctl.screen:  # always show where Rec will record while the app runs
+            target = ctl.screen
+            mode = "flash" if flashing else ("paused" if ctl.pending else "ready")
         else:
             target, mode = None, None
         screens = list(K.NSScreen.screens())
@@ -882,8 +899,10 @@ def run_app() -> None:
             w.orderOut_(None)
         overlays["wins"], overlays["key"] = [], key
         if key:
-            overlays["wins"] = [make_overlay(s, mode if fr(s) == tuple(target["frame"]) else "off")
-                                for s in screens]
+            others = mode in ("rec", "flash")  # "Not recorded" badges only when it matters
+            overlays["wins"] = [make_overlay(s, mode) if fr(s) == tuple(target["frame"])
+                                else make_overlay(s, "off") for s in screens
+                                if others or fr(s) == tuple(target["frame"])]
             widget_panel.orderFrontRegardless()
 
     class ScreenfeedPanel(K.NSPanel):
@@ -961,7 +980,17 @@ def run_app() -> None:
             self.pick.setToolTip_("Which display is recorded (picking one highlights it)")
             v.addSubview_(self.pick)
             self.pick_labels = []
-            self.stat = label(12, 104, W - 24, 11, K.NSColor.secondaryLabelColor())
+            self.stat = label(12, 104, W - 92, 11, K.NSColor.secondaryLabelColor())
+            self.quit = ScreenfeedButton.alloc().initWithFrame_(K.NSMakeRect(W - 78, 98, 70, 24))
+            self.quit.setBezelStyle_(K.NSBezelStyleRounded)
+            self.quit.setControlSize_(K.NSControlSizeSmall)
+            self.quit.setFont_(K.NSFont.systemFontOfSize_(11))
+            self.quit.setTitle_("Quit")
+            self.quit.setToolTip_("Exit screenfeed (stops recording)")
+            self.quit.setTarget_(self)
+            self.quit.setAction_("onQuit:")
+            v.addSubview_(self.quit)
+            self.quit_armed = 0.0
             self.msg = label(12, 88, W - 24, 11, K.NSColor.systemTealColor())
             hh = label(12, 68, W - 24, 10, K.NSColor.tertiaryLabelColor(), bold=True, h=14)
             hh.setStringValue_("SENT")
@@ -986,23 +1015,32 @@ def run_app() -> None:
         def onAuto_(self, sender):
             ctl.cycle_auto()
 
+        def onQuit_(self, sender):
+            # with unsent content, ask for a second click within 3 s
+            if ctl.has_unsent() and now() > self.quit_armed:
+                self.quit_armed = now() + 3
+                self.quit.setTitle_("Really?")
+                self.quit.setToolTip_("Unsent content will be lost. Click again to quit.")
+                return
+            self.quit.setTitle_("Quitting…")
+            AppHelper.callAfter(shutdown)
+
         def onDiscard_(self, sender):
             threading.Thread(target=ctl.discard, daemon=True).start()
 
         def onScreen_(self, sender):
-            pos = int(sender.indexOfSelectedItem()) + 1
-            threading.Thread(target=ctl.select_screen, args=(pos,), daemon=True).start()
+            pos = int(sender.indexOfSelectedItem())  # 0 = "No screen"
+            threading.Thread(target=ctl.select_screen, args=(pos or "none",), daemon=True).start()
 
         def syncPicker(self):
-            labels = [s["label"] for s in ctl.screens]
+            labels = ["No screen (recording off)"] + [s["label"] for s in ctl.screens]
             if labels != self.pick_labels:
                 self.pick.removeAllItems()
                 self.pick.addItemsWithTitles_(labels)
                 self.pick_labels = labels
-            if ctl.screen and ctl.screen["label"] in labels:
-                i = labels.index(ctl.screen["label"])
-                if self.pick.indexOfSelectedItem() != i:
-                    self.pick.selectItemAtIndex_(i)
+            i = labels.index(ctl.screen["label"]) if ctl.screen and ctl.screen["label"] in labels else 0
+            if self.pick.indexOfSelectedItem() != i:
+                self.pick.selectItemAtIndex_(i)
 
         def tick_(self, timer):
             t = now()
@@ -1024,9 +1062,14 @@ def run_app() -> None:
             self.syncPicker()
             self.view.layer().setBorderWidth_(3 if rec else 0)
             self.view.layer().setBorderColor_(K.NSColor.systemRedColor().CGColor())
+            if self.quit_armed and now() > self.quit_armed:
+                self.quit_armed = 0.0
+                self.quit.setTitle_("Quit")
+                self.quit.setToolTip_("Exit screenfeed (stops recording)")
             paused = not rec and bool(ctl.pending)
             self.rec.setTitle_("⏸ Pause" if rec else ("● Resume" if paused else "● Rec"))
             self.rec.setBezelColor_(K.NSColor.systemRedColor() if rec else None)
+            self.rec.setEnabled_(bool(rec or ctl.screen))
             u = fmt_dur(ctl.unsent_seconds())
             if rec:
                 self.unsent.setStringValue_(f"● REC   {u} unsent")
@@ -1034,6 +1077,9 @@ def run_app() -> None:
             elif paused:
                 self.unsent.setStringValue_(f"⏸ PAUSED   {u} unsent · Send, Resume or ✕")
                 self.unsent.setTextColor_(K.NSColor.systemOrangeColor())
+            elif not ctl.screen:
+                self.unsent.setStringValue_("No screen selected · pick one to record")
+                self.unsent.setTextColor_(K.NSColor.secondaryLabelColor())
             else:
                 self.unsent.setStringValue_("Nothing unsent")
                 self.unsent.setTextColor_(K.NSColor.tertiaryLabelColor())
@@ -1131,12 +1177,15 @@ def run_app() -> None:
     ctl.update_screens(all_screens())
     start_id = screen_info(ui.panel.screen() or K.NSScreen.mainScreen())["id"]
     try:  # remember the last picked screen across restarts (if still connected)
-        saved = json.loads((HOME / "state.json").read_text()).get("screen_id")
-        if any(x["id"] == saved for x in ctl.screens):
+        st = json.loads((HOME / "state.json").read_text())
+        saved = st.get("screen_id")
+        if "screen_id" in st and saved is None:
+            start_id = None
+        elif any(x["id"] == saved for x in ctl.screens):
             start_id = saved
     except (OSError, ValueError):
         pass
-    ctl.screen = next((x for x in ctl.screens if x["id"] == start_id), ctl.screen)
+    ctl.screen = next((x for x in ctl.screens if x["id"] == start_id), None)
     timer = K.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(1 / 30, ui, "tick:", None, True)
     K.NSRunLoop.currentRunLoop().addTimer_forMode_(timer, K.NSRunLoopCommonModes)
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -1208,7 +1257,8 @@ def cmd_watch() -> None:
             last_check = time.time()
             ok = running()
             if alive and not ok:
-                print("SCREENFEED ERROR app stopped running", flush=True)
+                print("SCREENFEED app stopped running (watch exits)", flush=True)
+                return
             alive = ok
         time.sleep(0.5)
 
@@ -1232,6 +1282,7 @@ def main(argv: list[str]) -> None:
             r = api("POST", "/say", " ".join(argv[2:]))
         elif cmd == "screens":
             r = api("GET", "/screens")
+            print(f"{'*' if not any(x['selected'] for x in r['screens']) else ' '} 0: none (recording off)")
             for x in r["screens"]:
                 print(f"{'*' if x['selected'] else ' '} {x['n']}: {x['label']}")
             return

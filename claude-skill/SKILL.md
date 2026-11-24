@@ -34,7 +34,9 @@ Never test with `say` or other audio playback; the user may be in a call. Only r
 
 1. `screenfeed launch`, then arm a Monitor with command `screenfeed watch`, timeout 1800000 ms,
    description "screenfeed batches". It prints one line per ready batch (`SCREENFEED BATCH n ready ... :: "<speech>"`)
-   or error (`SCREENFEED ERROR ...`). Re-arm it whenever it expires while the session is active.
+   or error (`SCREENFEED ERROR ...`). Re-arm it whenever it expires while the app is running.
+   When the user quits the app (Quit button), `watch` prints `SCREENFEED app stopped running` and
+   exits, so the watch ends with it; do not re-arm then.
    `watch` remembers what it printed, so re-arming does not lose or repeat batches.
 2. Tell the user they can press Rec, talk while pointing, and press Send (or turn on Auto).
 3. On each batch event:
@@ -58,7 +60,9 @@ Never test with `say` or other audio playback; the user may be in a call. Only r
   4 batches (time, number, length, auto/manual, processing / → Claude / skipped / failed).
   `screenfeed status` returns the same as `unsent_seconds`, `paused_with_unsent` and `history`.
 - The recorded screen is picked in the widget's "Screen:" dropdown, or with `screenfeed screens` /
-  `screenfeed screen <n|name>` (default: the display the widget starts on). Picking a screen flashes
+  `screenfeed screen <n|name|none>` (default: the last pick, else the display the widget starts on).
+  "No screen" disables recording (and pauses a running one). While the app runs and is not
+  recording, the selected display shows a green "Ready" frame. Picking a screen flashes
   "This screen will be recorded" on it for 2s; while recording, switching moves the recording at once
   and keeps what was recorded so far in the batch. While recording, that display gets a pulsing red frame and a
   "● REC" badge, and the widget gets a red border; other displays show "Not recorded".
