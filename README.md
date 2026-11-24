@@ -101,3 +101,7 @@ Everything runs locally; transcription uses a local whisper model. Raw video is 
 batch is processed, but batch folders in `~/.screenfeed/batches` (frames and transcripts) stay until
 you delete them, and they contain whatever was on screen. Whatever Claude reads from a batch is sent
 to Claude like any other file it reads.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
