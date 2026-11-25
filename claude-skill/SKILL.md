@@ -23,7 +23,7 @@ screenfeed discard           # throw away everything recorded but not sent (also
 screenfeed screens | screen <n|name>   # list / pick the recorded display
 screenfeed send              # cut and send the current batch now
 screenfeed retry <n>         # process a failed batch again from the raw video it kept
-screenfeed deliver [pr|local]  # one pull request per batch (default) or uncommitted changes
+screenfeed deliver [pr | main | branch <name or #PR>]  # where batches go: new PR each (default), main, one branch/PR
 screenfeed languages [en,de|auto]  # spoken languages (default en,de); others are re-read in the last allowed one
 screenfeed auto 60 | off     # periodic sending
 screenfeed say "text"        # show a short status line from Claude in the widget
@@ -50,25 +50,36 @@ Never test with `say` or other audio playback; the user may be in a call. Only r
      (the `app:` field and the full frame tell you which app/page). Deictic words ("this", "here", "das hier")
      refer to the element under the red ring at that moment.
    - Make the changes. Keep each batch's changes focused on what was said; do not refactor around it.
-   - Deliver them as `screenfeed status` says under `deliver` (set with `screenfeed deliver pr|local`):
-     - `pr` (default): **one pull request per batch**, in the repository of the app being shown. This
-       overrides a repository's habit of committing small fixes straight to main.
+   - Deliver them as the batch says: the `Deliver:` line in `timeline.md` (and `deliver` in the event) is the
+     mode when the batch was sent; the user picks it in the widget's Deliver picker or with
+     `screenfeed deliver pr | main | branch <name or #PR>`. In the repository of the app being shown:
+     - **New PR per batch** (`pr`, default): **one pull request per batch**. This overrides a repository's
+       habit of committing small fixes straight to main.
        1. Before editing: check `git status`. Changes that are not yours from an earlier batch: stop and
           ask. Then `git fetch` and `git switch -c screenfeed/batch-<n>-<short-slug> origin/<default branch>`,
           so every batch starts from the default branch and its PR holds only this batch.
        2. Edit, run the relevant tests (the repository's CLAUDE.md says how), commit with a message that
           says what changed and why, push, and `gh pr create` with a title in the imperative and a body
           with what the user said (quoted, from the transcript), what changed, the tests run, and
-          **before/after screenshots**: before = the batch frame cropped to the changed part of the
-          page; after = the same part of the page with the change, from the app running locally. Crop
-          both to the UI that changed and look at them first: nothing else from the screen (other apps,
-          video calls, notifications, personal data) goes into a PR. Upload them as GitHub attachments
-          in the PR description. No co-author lines.
+          **before/after screenshots** (see below). No co-author lines.
        3. `git switch` back to the default branch, and give the PR link in chat and a short note in the
           widget (`screenfeed say "Batch n: PR #123 ..."`).
        A later batch that corrects an earlier one that is still open goes onto that batch's branch and PR.
-       A batch with nothing to change (no speech, only clicking) gets no PR.
-     - `local`: leave the changes uncommitted in the working tree.
+     - **Commit to main** (`main`): `git switch <default branch>` and `git pull --ff-only`, edit, run the
+       relevant tests, commit, push. No pull request; describe the change and the tests in chat.
+     - **Branch / PR** (`branch`, with a target): every batch goes onto that branch. A target like `#123` is
+       a pull request: its branch is `gh pr view 123 --json headRefName`. Switch to the branch (fetch it,
+       create it from the default branch if it does not exist yet), edit, test, commit, push. If the branch
+       has no pull request yet, open one; then add a section per batch to its description (what was said,
+       what changed, tests, before/after screenshots). Switch back to the default branch afterwards.
+     **Before/after screenshots** (for every PR): before = the batch frame cropped to the changed part of
+     the page; after = the same part with the change, from the app running locally on the branch (for
+     entropy-data: the `ui-test` skill's start command and `/start`, which signs in a demo organization).
+     Crop both to the UI that changed and look at them first: nothing else from the screen (other apps,
+     video calls, notifications, personal data, colleagues' names) goes into a PR. Store them on the
+     repository's `pr-screenshots` branch (image only, no history with main) and link them in the PR
+     description as `https://github.com/<owner>/<repo>/blob/pr-screenshots/pr-<n>/before.png?raw=true`.
+     A batch with nothing to change (no speech, only clicking) gets no commit and no PR.
    - `screenfeed say "Batch n: <what changed, max ~60 chars>"` so the user sees it on screen,
      and give a short summary in chat. If a remark is ambiguous, ask in chat and say so in the widget
      ("Batch n: question in terminal").
@@ -96,6 +107,8 @@ Never test with `say` or other audio playback; the user may be in a call. Only r
   default system input), `SCREENFEED_FPS` (5), `SCREENFEED_KEEP_VIDEO=1`, `SCREENFEED_WHISPER_MODEL`.
 - `screenfeed status` shows `capture`: `sck` leaves screenfeed's widget, frame and badges out of the video;
   `avfoundation` (fallback, see `capture_problem`) records them, so ignore them in the frames then.
+- The widget shows a permission banner (and `screenfeed status` lists `permission_problems`) when Screen
+  Recording or Microphone permission is missing for the app screenfeed runs in, or the capture falls back.
 - `screenfeed status` shows `ui_tick_age`: seconds since the widget last refreshed. Above a few
   seconds the widget is frozen (clicks still reach the app but nothing updates); `watch` then prints
   `SCREENFEED ERROR widget not refreshing`. Check the log for `ui refresh failed`.

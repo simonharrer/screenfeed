@@ -25,8 +25,8 @@ Commands:
   screenfeed screen none      no screen: recording disabled (pauses a running recording)
   screenfeed send             cut the current batch and send it
   screenfeed retry <n>        process a failed batch again from the raw video it kept
-  screenfeed deliver [pr|local]   how Claude delivers each batch's changes: one pull request per
-                              batch (default) or uncommitted changes in the working tree
+  screenfeed deliver [pr | main | branch <name or #PR>]   where Claude puts each batch's changes: a new
+                              pull request per batch from main (default), commits on main, or one branch/PR
   screenfeed languages [x,y|auto]  show or set the spoken languages (default en,de); others are re-read
                               in the last allowed one (whisper invents foreign text on silence)
   screenfeed auto <sec|off>   send automatically every <sec> seconds
@@ -257,6 +257,38 @@ def ensure_sck() -> None:
     except Exception as e:  # noqa: BLE001
         SCK["failed"] = str(e)
         log_exc("sfcapture unavailable, recording with avfoundation (screenfeed itself shows in the video)", e)
+
+
+SETTINGS_PANES = {
+    "screen": "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+    "microphone": "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+}
+
+
+def permission_problems() -> list[dict]:
+    """What keeps screenfeed from recording properly, for the widget's banner: missing Screen Recording or
+    Microphone permission (granted to the app screenfeed was started from, e.g. the terminal), or a
+    ScreenCaptureKit helper that cannot capture."""
+    problems = []
+    try:
+        import Quartz
+
+        if not Quartz.CGPreflightScreenCaptureAccess():
+            problems.append({"kind": "screen", "text": "Allow Screen Recording for the app screenfeed runs in"})
+    except Exception as e:  # noqa: BLE001
+        log("permission check failed", what="screen", error=repr(e))
+    if default_audio_device() != "none":
+        try:
+            import AVFoundation as AV
+
+            # 3 = authorized; 0 = not asked yet (the first recording asks), 1/2 = restricted/denied
+            if AV.AVCaptureDevice.authorizationStatusForMediaType_(AV.AVMediaTypeAudio) in (1, 2):
+                problems.append({"kind": "microphone", "text": "Allow the Microphone for the app screenfeed runs in"})
+        except Exception as e:  # noqa: BLE001
+            log("permission check failed", what="microphone", error=repr(e))
+    if SCK["failed"] and not problems:
+        problems.append({"kind": "screen", "text": "Screen capture falls back: screenfeed shows in the video"})
+    return problems
 
 
 def capture_size(screen: dict) -> tuple[int, int]:
@@ -550,6 +582,7 @@ class Controller:
         self.claude_msg = ""
         self.claude_msg_at: float | None = None
         self.ui_tick_at: float | None = None  # the widget's last refresh: a frozen widget shows here
+        self.permission_problems: list[dict] = []  # checked by the widget every few seconds
         self.last_batch: dict | None = None
         self.history: deque = deque(maxlen=20)  # newest first: sent batches and their fate
         self.busy = 0
@@ -793,7 +826,7 @@ class Controller:
         self.set_auto(AUTO_STEPS[(i + 1) % len(AUTO_STEPS)])
 
     def _queue(self, t0: float, t1: float, manual: bool, samples: list, apps: list,
-               recovered: bool = False) -> int:
+               recovered: bool = False, deliver: dict | None = None) -> int:
         """Queue the batch t0..t1 for the worker (caller holds the lock). Recorders are not touched."""
         no = self.batch_no
         self.batch_no += 1
@@ -802,7 +835,7 @@ class Controller:
         self.history.appendleft(entry)
         recs = [r for r in self.recorders if r.started_at < t1 and (r.stopped_at or now()) > t0]
         self.jobs.put(dict(no=no, t0=t0, t1=t1, recs=recs, samples=samples, apps=apps, manual=manual,
-                           recovered=recovered, entry=entry))
+                           recovered=recovered, entry=entry, deliver=deliver or deliver_mode()))
         log("batch queued", batch=no, t0=t0, t1=t1, recorders=",".join(r.name for r in recs) or "none",
             seconds=entry["seconds"], samples=len(samples), recovered=recovered)
         return no
@@ -821,7 +854,7 @@ class Controller:
             samples = [s for s in self.samples if t0 - 1 <= s[0] <= t1 + 1]
             while self.samples and self.samples[0][0] < t1 - 2:
                 self.samples.popleft()
-            no = self._queue(t0, t1, manual, samples=samples, apps=list(self.apps))
+            no = self._queue(t0, t1, manual, samples=samples, apps=list(self.apps), deliver=deliver_mode())
             if self.auto and self.recording:
                 self.next_auto = now() + self.auto
             self.status = f"Batch {no}: processing…"
@@ -972,11 +1005,14 @@ class Controller:
             "build": BUILD,
             "log": str(LOG),
             "ui_tick_age": round(now() - self.ui_tick_at, 1) if self.ui_tick_at else None,
+            "widget_frame": [round(v) for v in self.widget_frame],  # x, y (bottom-left), width, height in points
             "languages": languages() or "auto",
             "deliver": deliver_mode(),
+            "deliver_label": deliver_label(deliver_mode()),
             "capture": (self.rec.capture if self.rec else
                         ("sck" if CAPTURE == "sck" and SCK["ready"] and not SCK["failed"] else "avfoundation")),
             "capture_problem": SCK["failed"],
+            "permission_problems": [p["text"] for p in self.permission_problems],
             "history": [dict(h, sent_at=time.strftime("%H:%M:%S", time.localtime(h["sent_at"])),
                              sent_ago=fmt_ago(h["sent_at"]))
                         for h in self.history],
@@ -993,7 +1029,7 @@ class Controller:
 
 def save_job(job: dict, d: Path) -> None:
     """What a batch is made of, so that it can be processed again (screenfeed retry)."""
-    keep = {k: job[k] for k in ("no", "t0", "t1", "samples", "apps", "manual", "recovered", "parts") if k in job}
+    keep = {k: job[k] for k in ("no", "t0", "t1", "samples", "apps", "manual", "recovered", "parts", "deliver") if k in job}
     (d / "job.json").write_text(json.dumps(keep, ensure_ascii=False))
 
 
@@ -1099,14 +1135,26 @@ def languages() -> list[str]:
     return [] if value in ("", "auto", "any") else [x.strip() for x in value.split(",") if x.strip()]
 
 
-def deliver_mode() -> str:
-    """How Claude delivers the changes for a batch: "pr" (default: one branch and pull request per batch)
-    or "local" (changes stay uncommitted in the working tree). Set with `screenfeed deliver`."""
+DELIVER_MODES = ("pr", "main", "branch")
+
+
+def deliver_mode() -> dict:
+    """Where Claude puts the changes of a batch: {"mode": "pr"} (default: a new branch and pull request from
+    the default branch per batch), {"mode": "main"} (commit to the default branch and push) or
+    {"mode": "branch", "target": "<branch or #PR>"} (every batch onto that branch and its pull request).
+    Set with `screenfeed deliver` or the widget's Deliver picker; stored as "pr", "main" or "branch:<target>"."""
     try:
-        value = json.loads(CONFIG.read_text()).get("deliver")
+        value = str(json.loads(CONFIG.read_text()).get("deliver") or "")
     except (OSError, ValueError):
-        value = None
-    return value if value in ("pr", "local") else os.environ.get("SCREENFEED_DELIVER", "pr")
+        value = ""
+    value = value or os.environ.get("SCREENFEED_DELIVER", "pr")
+    if value.startswith("branch:") and value[len("branch:"):].strip():
+        return {"mode": "branch", "target": value[len("branch:"):].strip()}
+    return {"mode": value if value in ("pr", "main") else "pr"}
+
+
+def deliver_label(d: dict) -> str:
+    return {"pr": "New PR per batch", "main": "Commit to main"}.get(d["mode"]) or f"Branch / PR: {d.get('target')}"
 
 
 def set_config(key: str, value: str) -> None:
@@ -1361,6 +1409,8 @@ def process_batch(job: dict, d: Path) -> dict:
     if gaps:
         out.append("- Recording gaps (the recorder failed and was restarted; anything said then is missing): "
                    + ", ".join(f"{fmt_dur(a - t0)}–{fmt_dur(b - t0)}" for a, b in gaps))
+    deliver = job.get("deliver") or deliver_mode()
+    out.append(f"- Deliver: {deliver_label(deliver)} (the mode when this batch was sent; `deliver` in the event)")
     if job.get("recovered"):
         out.append("- Recovered: recorded in an earlier screenfeed run that ended before this was sent "
                    "(crash or quit). Cursor data was not kept, so there are no pointing frames.")
@@ -1394,7 +1444,7 @@ def process_batch(job: dict, d: Path) -> dict:
 
     preview = " ".join(s[2] for s in speech)
     event = {"batch": no, "dir": str(d), "timeline": str(timeline), "seconds": int(rec_s),
-             "moments": len(rendered), "speech": preview[:200], "gaps": len(gaps), "t": now()}
+             "moments": len(rendered), "speech": preview[:200], "gaps": len(gaps), "deliver": deliver, "t": now()}
     emit(event)
     return event
 
@@ -1577,7 +1627,7 @@ def run_app() -> None:
 
     class ScreenfeedUI(K.NSObject):
         def build(self):
-            W, H = 340, 286
+            W, H = 340, 314
             self.W, self.H = W, H
             vf = K.NSScreen.mainScreen().visibleFrame()
             rect = K.NSMakeRect(vf.origin.x + vf.size.width - W - 24, vf.origin.y + 24, W, H)
@@ -1704,17 +1754,56 @@ def run_app() -> None:
             v.addSubview_(self.autopick)
             self.auto_steps = []
 
-            separator(122)
-            self.stat = label(R(12, 130, W - 24, 15), 11, secondary)
-            self.claude_icon = icon(R(11, 148, 16, 15), "sparkles", 11, K.NSColor.systemOrangeColor())
-            self.msg = label(R(30, 148, W - 42, 15), 11, K.NSColor.labelColor())
+            # where Claude puts the changes of a batch
+            icon(R(12, 120, 18, 18), "arrow.triangle.branch", 13, secondary)
+            self.deliverpick = K.NSPopUpButton.alloc().initWithFrame_pullsDown_(R(30, 116, W - 42, 26), False)
+            self.deliverpick.setBordered_(False)
+            self.deliverpick.setFont_(K.NSFont.systemFontOfSize_(12))
+            self.deliverpick.setTarget_(self)
+            self.deliverpick.setAction_("onDeliver:")
+            self.deliverpick.setToolTip_("Where Claude puts the changes of each batch")
+            v.addSubview_(self.deliverpick)
+            self.deliver_items = []
 
-            separator(172)
-            hdr = label(R(12, 180, 200, 13), 10, tertiary, weight=0.3)
+            separator(150)
+            self.stat = label(R(12, 158, W - 24, 15), 11, secondary)
+            self.claude_icon = icon(R(11, 176, 16, 15), "sparkles", 11, K.NSColor.systemOrangeColor())
+            self.msg = label(R(30, 176, W - 42, 15), 11, K.NSColor.labelColor())
+
+            # permission banner: over the status and Claude lines while something is missing
+            self.banner = K.NSView.alloc().initWithFrame_(R(10, 154, W - 20, 40))
+            self.banner.setWantsLayer_(True)
+            self.banner.layer().setCornerRadius_(8)
+            self.banner.layer().setBackgroundColor_(K.NSColor.colorWithRed_green_blue_alpha_(0.45, 0.33, 0.05, 0.95).CGColor())
+            self.banner.setHidden_(True)
+            bw = W - 20
+            warn = K.NSImageView.alloc().initWithFrame_(K.NSMakeRect(8, 12, 16, 16))
+            warn.setImage_(symbol("exclamationmark.triangle.fill", 12))
+            warn.setContentTintColor_(K.NSColor.systemYellowColor())
+            self.banner.addSubview_(warn)
+            self.banner_text = K.NSTextField.labelWithString_("")
+            self.banner_text.setFrame_(K.NSMakeRect(30, 4, bw - 30 - 84, 32))
+            self.banner_text.setFont_(K.NSFont.systemFontOfSize_weight_(11, 0.2))
+            self.banner_text.setTextColor_(K.NSColor.whiteColor())
+            self.banner_text.setMaximumNumberOfLines_(2)
+            self.banner_text.setLineBreakMode_(K.NSLineBreakByWordWrapping)
+            self.banner.addSubview_(self.banner_text)
+            self.banner_btn = K.NSButton.alloc().initWithFrame_(K.NSMakeRect(bw - 80, 8, 72, 24))
+            self.banner_btn.setTitle_("Settings")
+            self.banner_btn.setBezelStyle_(K.NSBezelStyleRounded)
+            self.banner_btn.setControlSize_(K.NSControlSizeSmall)
+            self.banner_btn.setTarget_(self)
+            self.banner_btn.setAction_("onPermissions:")
+            self.banner.addSubview_(self.banner_btn)
+            v.addSubview_(self.banner)
+            self.permissions_checked = 0.0
+
+            separator(200)
+            hdr = label(R(12, 208, 200, 13), 10, tertiary, weight=0.3)
             hdr.setStringValue_("SENT TO CLAUDE")
             self.hist_icons, self.hist = [], []
             for i in range(4):
-                top = 197 + 17 * i
+                top = 225 + 17 * i
                 self.hist_icons.append(icon(R(11, top, 15, 15), "circle", 11, tertiary))
                 self.hist.append(label(R(30, top, W - 42, 15), 11, secondary, mono=True))
 
@@ -1767,6 +1856,65 @@ def run_app() -> None:
                 ctl.status = "Click ⏻ again to quit · unsent recording is sent on next start"
                 return
             AppHelper.callAfter(shutdown)
+
+        def onDeliver_(self, sender):
+            i = int(sender.indexOfSelectedItem())
+            if not (0 <= i < len(self.deliver_items)):
+                return
+            choice = self.deliver_items[i]
+            if choice == "ask":
+                target = self.askBranch()
+                if not target:
+                    self.deliver_key = None  # back to the current mode in the picker
+                    return
+                choice = f"branch:{target}"
+            set_config("deliver", choice)
+            log("ui deliver", mode=choice)
+            self.deliver_key = None
+
+        @objc.python_method
+        def askBranch(self) -> str | None:
+            """A small dialog for the branch name or pull request number (#123)."""
+            K.NSApp.activateIgnoringOtherApps_(True)
+            alert = K.NSAlert.alloc().init()
+            alert.setMessageText_("Deliver to a branch or pull request")
+            alert.setInformativeText_("Every batch goes onto this branch, in the repository of the app you show. "
+                                      "A pull request number like #123 means its branch.")
+            field = K.NSTextField.alloc().initWithFrame_(K.NSMakeRect(0, 0, 260, 24))
+            field.setPlaceholderString_("feature/my-branch or #123")
+            current = deliver_mode()
+            if current.get("target"):
+                field.setStringValue_(current["target"])
+            alert.setAccessoryView_(field)
+            alert.addButtonWithTitle_("Use")
+            alert.addButtonWithTitle_("Cancel")
+            alert.window().setInitialFirstResponder_(field)
+            if alert.runModal() != K.NSAlertFirstButtonReturn:
+                return None
+            return str(field.stringValue()).strip() or None
+
+        @objc.python_method
+        def syncDeliver(self):
+            d = deliver_mode()
+            key = json.dumps(d, sort_keys=True)
+            if getattr(self, "deliver_key", None) == key:
+                return
+            self.deliver_key = key
+            items = [("pr", "New PR per batch (from main)"), ("main", "Commit to main")]
+            if d["mode"] == "branch":
+                items.append((f"branch:{d['target']}", f"Branch / PR: {d['target']}"))
+            items.append(("ask", "Branch / PR…"))
+            self.deliver_items = [k for k, _ in items]
+            self.deliverpick.removeAllItems()
+            self.deliverpick.addItemsWithTitles_([t for _, t in items])
+            current = "branch:" + d["target"] if d["mode"] == "branch" else d["mode"]
+            self.deliverpick.selectItemAtIndex_(self.deliver_items.index(current))
+
+        def onPermissions_(self, sender):
+            problems = ctl.permission_problems
+            kind = problems[0]["kind"] if problems else "screen"
+            log("ui click: permission settings", kind=kind)
+            subprocess.Popen(["open", SETTINGS_PANES.get(kind, SETTINGS_PANES["screen"])])
 
         def onDiscard_(self, sender):
             log("ui click: discard", enabled=getattr(sender, "sf_enabled", True))
@@ -1842,10 +1990,20 @@ def run_app() -> None:
             self.n += 1
             if self.n % 6 and t > self.fast_until:  # 5 Hz, but 30 Hz right after a click
                 return
+            if t - self.permissions_checked > 5:
+                self.permissions_checked = t
+                problems = permission_problems()
+                if [p["text"] for p in problems] != [p["text"] for p in ctl.permission_problems]:
+                    log("permissions", problems=" | ".join(p["text"] for p in problems) or "none")
+                ctl.permission_problems = problems
+                self.banner.setHidden_(not problems)
+                if problems:
+                    self.banner_text.setStringValue_(" · ".join(p["text"] for p in problems))
             rec = ctl.recording
             paused = ctl.paused_with_unsent()
             sync_overlays(self.panel)
             self.syncPicker()
+            self.syncDeliver()
             if getattr(self, "edge_rec", None) != rec:
                 self.edge_rec = rec
                 self.edge.layer().setBorderWidth_(2 if rec else 0.5)
@@ -2167,10 +2325,14 @@ def main(argv: list[str]) -> None:
             return
         elif cmd == "deliver":
             if len(argv) > 2:
-                if argv[2] not in ("pr", "local"):
-                    sys.exit("usage: screenfeed deliver <pr|local>")
-                set_config("deliver", argv[2])
-            print(deliver_mode())
+                mode = argv[2]
+                if mode == "branch" and len(argv) > 3 and argv[3].strip():
+                    set_config("deliver", f"branch:{argv[3].strip()}")
+                elif mode in ("pr", "main"):
+                    set_config("deliver", mode)
+                else:
+                    sys.exit("usage: screenfeed deliver pr | main | branch <branch or #PR>")
+            print(deliver_label(deliver_mode()))
             return
         elif cmd == "retry":
             if len(argv) < 3 or not argv[2].isdigit():

@@ -45,6 +45,7 @@ screenfeed launch
 | **Send** | Cut the current batch and hand it to Claude |
 | **Discard** | Throw away what was recorded but not sent yet; it never reaches Claude |
 | Display picker | Which display is recorded, or "No screen" to disable recording; remembered across restarts |
+| Deliver picker | Where Claude puts each batch's changes: a new pull request per batch from main, commits on main, or one branch / pull request (asks for its name or #number) |
 | Auto-send picker | Off, every 30 s, 1, 2 or 5 min (batches without speech are skipped) |
 | ✨ line | The latest status message from Claude, with how long ago it came ("1 min ago") |
 | Sent to Claude | The last 4 batches: how long ago ("just now", "3 min ago", in whole minutes), number, length, and whether they reached Claude |
@@ -63,7 +64,8 @@ screenfeed start | stop            record / pause   (aliases: resume | pause)
 screenfeed send                    send the current batch
 screenfeed retry <n>               process a failed batch again from the raw video it kept
 screenfeed languages [en,de|auto]  show or set the spoken languages (default en,de)
-screenfeed deliver [pr|local]      how Claude delivers each batch: one pull request per batch (default)
+screenfeed deliver [pr|main|branch <name or #PR>]  where Claude puts each batch: a new PR per batch from main
+                                   (default), commits on main, or one branch / pull request; also in the widget
 screenfeed discard                 throw away unsent content
 screenfeed auto <seconds|off>      periodic sending
 screenfeed screens                 list displays (* = selected)
@@ -110,7 +112,11 @@ The screen is recorded with ScreenCaptureKit through a small Swift helper (`sfca
 recording frame and badges out of the video, and draws the cursor. ffmpeg adds the microphone and cuts the
 chunks. If the helper cannot be built or cannot capture, screenfeed falls back to ffmpeg's AVFoundation
 capture, which records whatever is on screen; `screenfeed status` shows `capture` and `capture_problem`.
-`SCREENFEED_CAPTURE=avfoundation` forces the fallback. Needs Xcode or the Command Line Tools.
+`SCREENFEED_CAPTURE=avfoundation` forces the fallback.
+
+When Screen Recording or Microphone permission is missing for the app screenfeed runs in (for example
+the terminal), or the capture falls back, the widget shows a banner with a button that opens the right
+Settings page. Needs Xcode or the Command Line Tools.
 
 ## No lost batches
 
