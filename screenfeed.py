@@ -73,6 +73,8 @@ AUDIO = os.environ.get("SCREENFEED_AUDIO", "")  # device name, "none", or "" = s
 FPS = int(os.environ.get("SCREENFEED_FPS", "5"))
 KEEP_VIDEO = os.environ.get("SCREENFEED_KEEP_VIDEO") == "1"
 MAX_MOMENTS = int(os.environ.get("SCREENFEED_MAX_MOMENTS", "24"))
+# The watch ends after this many seconds with no screen picked and nothing unsent (see cmd_watch).
+WATCH_IDLE_EXIT = int(os.environ.get("SCREENFEED_WATCH_IDLE_EXIT", "600"))
 FFMPEG = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
 
 
@@ -1285,6 +1287,34 @@ def render_frame(seg: Clip, t: float, x: float, y: float, base: Path) -> dict:
     return out
 
 
+def spread(items: list, n: int) -> list:
+    """At most n of items, evenly spread over the list (all of them when they fit)."""
+    if n <= 0:
+        return []
+    if len(items) <= n:
+        return list(items)
+    step = len(items) / n
+    return [items[int(i * step)] for i in range(n)]
+
+
+def select_moments(moments: list[dict], limit: int) -> list[dict]:
+    """The moments a batch shows, at most limit, in time order. What was said comes first: one moment for every
+    sentence, then the further moments of sentences (a second click, another resting point), and only then clicks
+    without speech, which are navigation context. Each group is spread evenly when it does not fit."""
+    by_time = sorted(moments, key=lambda m: m["t"])
+    first, more, seen = [], [], set()
+    for m in by_time:
+        if m["speech"] is None:
+            continue
+        (more if m["speech"] in seen else first).append(m)
+        seen.add(m["speech"])
+    silent = [m for m in by_time if m["speech"] is None]
+    chosen = spread(first, limit)
+    chosen += spread(more, limit - len(chosen))
+    chosen += spread(silent, limit - len(chosen))
+    return sorted(chosen, key=lambda m: m["t"])
+
+
 def process_batch(job: dict, d: Path) -> dict:
     no, t0, t1 = job["no"], job["t0"], job["t1"]
     samples, apps = job["samples"], job["apps"]
@@ -1330,8 +1360,14 @@ def process_batch(job: dict, d: Path) -> dict:
     def in_range(s):
         return t0 <= s[0] <= t1
 
-    clicks = [s for i, s in enumerate(samples)
-              if s[3] and (i == 0 or not samples[i - 1][3]) and not s[4] and in_range(s)]
+    clicks = []
+    for i, s in enumerate(samples):
+        if not (s[3] and (i == 0 or not samples[i - 1][3]) and not s[4] and in_range(s)):
+            continue
+        # A double or triple click is one action: one moment, not three copies of the same picture.
+        if clicks and s[0] - clicks[-1][0] < 1.0 and math.dist((s[1], s[2]), (clicks[-1][1], clicks[-1][2])) < 30:
+            continue
+        clicks.append(s)
     moments = []  # dict(t, x, y, kind, speech, dwell)
     used_clicks = set()
     for si, (ts, te, _) in enumerate(speech):
@@ -1355,12 +1391,10 @@ def process_batch(job: dict, d: Path) -> dict:
     end = cursor_at(samples, t1 - END_MARGIN)
     end_t = max(t0, t1 - END_MARGIN)
 
-    spoken = [m for m in moments if m["speech"] is not None]
-    other = sorted([m for m in moments if m["speech"] is None], key=lambda m: m["t"])
-    if len(spoken) > MAX_MOMENTS:
-        step = len(spoken) / MAX_MOMENTS
-        spoken = [spoken[int(i * step)] for i in range(MAX_MOMENTS)]
-    moments = sorted(spoken + other[: max(0, MAX_MOMENTS - len(spoken))], key=lambda m: m["t"])
+    found = len(moments)
+    moments = select_moments(moments, MAX_MOMENTS)
+    if found > len(moments):
+        log("moments capped", batch=no, found=found, kept=len(moments))
     if end:
         moments.append(dict(t=end_t, x=end[1], y=end[2], kind="end", speech=None, dwell=0))
 
@@ -2260,13 +2294,23 @@ def ui_tick_age() -> float | None:
         return None
 
 
+def watch_idle() -> bool:
+    """True when no batch can come: no screen picked, not recording, nothing unsent, sending or processing."""
+    try:
+        st = api("GET", "/status", timeout=3)
+    except Exception:  # noqa: BLE001
+        return False
+    return (not st.get("screen") and not st.get("recording") and not st.get("unsent_seconds")
+            and not st.get("sending") and not st.get("processing"))
+
+
 def cmd_watch() -> None:
     """One stdout line per ready batch or error. Remembers what it already printed."""
     cursor = HOME / "watch.cursor"
     HOME.mkdir(parents=True, exist_ok=True)
     READY.touch()
     seen = int(cursor.read_text() or 0) if cursor.exists() else len(READY.read_text().splitlines())
-    alive, last_check, frozen = running(), 0.0, False
+    alive, last_check, frozen, idle_since = running(), 0.0, False, None
     print(f"SCREENFEED watching (app {'running' if alive else 'NOT running'})", flush=True)
     while True:
         lines = READY.read_text().splitlines()
@@ -2292,6 +2336,16 @@ def cmd_watch() -> None:
                 print("SCREENFEED app stopped running (watch exits)", flush=True)
                 return
             alive = ok
+            # Nothing can arrive while no screen is picked and nothing is recorded, unsent or in the works: after a
+            # while the watch ends instead of being re-armed for hours. Picking a screen is when to re-arm it.
+            if ok and watch_idle():
+                idle_since = idle_since or time.time()
+                if time.time() - idle_since > WATCH_IDLE_EXIT:
+                    print(f"SCREENFEED idle: no screen selected and nothing unsent for {WATCH_IDLE_EXIT // 60} min "
+                          "(watch exits; re-arm when a screen is picked)", flush=True)
+                    return
+            else:
+                idle_since = None
             age = ui_tick_age() if ok else None
             if slept:
                 age = None

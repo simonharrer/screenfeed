@@ -37,15 +37,29 @@ Never test with `say` or other audio playback; the user may be in a call. Only r
 
 1. `screenfeed launch`, then arm a Monitor with command `screenfeed watch`, timeout 1800000 ms,
    description "screenfeed batches". It prints one line per ready batch (`SCREENFEED BATCH n ready ... :: "<speech>"`)
-   or error (`SCREENFEED ERROR ...`). Re-arm it whenever it expires while the app is running.
-   When the user quits the app (Quit button), `watch` prints `SCREENFEED app stopped running` and
-   exits, so the watch ends with it; do not re-arm then.
+   or error (`SCREENFEED ERROR ...`).
+   When it expires, check `screenfeed status` and re-arm only while a batch can still come: a screen is
+   selected (`screen` set), or something is recording, unsent, sending or processing. Otherwise do not re-arm:
+   say once in chat that the watch is off until a screen is picked, and re-arm when the user asks.
+   `watch` also ends on its own: `SCREENFEED app stopped running` (the user quit the app) and
+   `SCREENFEED idle: …` (no screen and nothing unsent for 10 minutes, `SCREENFEED_WATCH_IDLE_EXIT`).
+   Do not re-arm after either; one short line in chat is enough.
    `watch` remembers what it printed, so re-arming does not lose or repeat batches.
 2. Tell the user they can press Rec, talk while pointing, and press Send (or turn on Auto).
 3. On each batch event:
    - `screenfeed say "Batch n: reading"`
    - Read `timeline.md`. Read the `zoom` image of every SAID moment (that is what the user pointed at) and
      the `full` images when you need the context of the page. Read the END STATE frame to know the current state.
+   - Decide first what kind of batch it is:
+     - **Change request**: concrete remarks about what is on screen ("align this", "show the icon here",
+       "render this as Markdown"). Go on with the steps below.
+     - **Discussion**: a conversation (several voices, "wie komme ich eigentlich …", ideas, "das muss man mal
+       analysieren"), a feature idea that needs design, or remarks spread over several topics. Do not change code.
+       Summarize the points in chat (one line each, with what you see in the frames), propose a scope for each
+       (quick fix, own PR, analysis first, not now), recommend where to start, and ask. Show
+       `screenfeed say "Batch n: question in terminal"`. Act when the user answers; one answer can start several
+       PRs (in the `pr` mode, one fork per PR).
+     A batch can be both: deliver the concrete remarks, and ask about the rest in the same message.
    - Map what was said + pointed at to concrete changes in the code of the app being shown
      (the `app:` field and the full frame tell you which app/page). Deictic words ("this", "here", "das hier")
      refer to the element under the red ring at that moment.
@@ -111,6 +125,8 @@ Never test with `say` or other audio playback; the user may be in a call. Only r
   video (error event says `screenfeed retry <n>`; run it); content left by a crash or quit arrives as a
   recovered batch on the next start (no cursor data, so no pointing frames).
 - Auto-sent batches without speech are skipped; a manual Send always produces a batch.
+- A batch shows at most 24 moments (`SCREENFEED_MAX_MOMENTS`): one per sentence first, then further moments of
+  sentences, then clicks without speech. A double or triple click is one moment.
 - The widget shows the unsent recorded time (frozen while paused) and a SENT history of the last
   4 batches (time, number, length, auto/manual, processing / → Claude / skipped / failed).
   `screenfeed status` returns the same as `unsent_seconds`, `paused_with_unsent` and `history`.
