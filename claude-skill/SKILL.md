@@ -23,6 +23,7 @@ screenfeed discard           # throw away everything recorded but not sent (also
 screenfeed screens | screen <n|name>   # list / pick the recorded display
 screenfeed send              # cut and send the current batch now
 screenfeed retry <n>         # process a failed batch again from the raw video it kept
+screenfeed deliver [pr|local]  # one pull request per batch (default) or uncommitted changes
 screenfeed languages [en,de|auto]  # spoken languages (default en,de); others are re-read in the last allowed one
 screenfeed auto 60 | off     # periodic sending
 screenfeed say "text"        # show a short status line from Claude in the widget
@@ -49,6 +50,25 @@ Never test with `say` or other audio playback; the user may be in a call. Only r
      (the `app:` field and the full frame tell you which app/page). Deictic words ("this", "here", "das hier")
      refer to the element under the red ring at that moment.
    - Make the changes. Keep each batch's changes focused on what was said; do not refactor around it.
+   - Deliver them as `screenfeed status` says under `deliver` (set with `screenfeed deliver pr|local`):
+     - `pr` (default): **one pull request per batch**, in the repository of the app being shown. This
+       overrides a repository's habit of committing small fixes straight to main.
+       1. Before editing: check `git status`. Changes that are not yours from an earlier batch: stop and
+          ask. Then `git fetch` and `git switch -c screenfeed/batch-<n>-<short-slug> origin/<default branch>`,
+          so every batch starts from the default branch and its PR holds only this batch.
+       2. Edit, run the relevant tests (the repository's CLAUDE.md says how), commit with a message that
+          says what changed and why, push, and `gh pr create` with a title in the imperative and a body
+          with what the user said (quoted, from the transcript), what changed, the tests run, and
+          **before/after screenshots**: before = the batch frame cropped to the changed part of the
+          page; after = the same part of the page with the change, from the app running locally. Crop
+          both to the UI that changed and look at them first: nothing else from the screen (other apps,
+          video calls, notifications, personal data) goes into a PR. Upload them as GitHub attachments
+          in the PR description. No co-author lines.
+       3. `git switch` back to the default branch, and give the PR link in chat and a short note in the
+          widget (`screenfeed say "Batch n: PR #123 ..."`).
+       A later batch that corrects an earlier one that is still open goes onto that batch's branch and PR.
+       A batch with nothing to change (no speech, only clicking) gets no PR.
+     - `local`: leave the changes uncommitted in the working tree.
    - `screenfeed say "Batch n: <what changed, max ~60 chars>"` so the user sees it on screen,
      and give a short summary in chat. If a remark is ambiguous, ask in chat and say so in the widget
      ("Batch n: question in terminal").
@@ -74,6 +94,11 @@ Never test with `say` or other audio playback; the user may be in a call. Only r
   "● REC" badge, and the widget gets a red border; other displays show "Not recorded".
 - Config via env vars: `SCREENFEED_LANGUAGES` (default `en,de`; or `screenfeed languages`), `SCREENFEED_LANG` (one fixed language), `SCREENFEED_AUDIO` (mic name or `none`,
   default system input), `SCREENFEED_FPS` (5), `SCREENFEED_KEEP_VIDEO=1`, `SCREENFEED_WHISPER_MODEL`.
+- `screenfeed status` shows `capture`: `sck` leaves screenfeed's widget, frame and badges out of the video;
+  `avfoundation` (fallback, see `capture_problem`) records them, so ignore them in the frames then.
+- `screenfeed status` shows `ui_tick_age`: seconds since the widget last refreshed. Above a few
+  seconds the widget is frozen (clicks still reach the app but nothing updates); `watch` then prints
+  `SCREENFEED ERROR widget not refreshing`. Check the log for `ui refresh failed`.
 - Debugging: every action (widget clicks, CLI/API calls, recorder start/stop with pid, exit code and
   file size, sends, batch processing, uncaught errors with tracebacks) is logged to
   `~/.screenfeed/screenfeed.log` (rotated to `.log.1` at 5 MB). Read it first when a batch does not arrive.

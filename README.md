@@ -63,6 +63,7 @@ screenfeed start | stop            record / pause   (aliases: resume | pause)
 screenfeed send                    send the current batch
 screenfeed retry <n>               process a failed batch again from the raw video it kept
 screenfeed languages [en,de|auto]  show or set the spoken languages (default en,de)
+screenfeed deliver [pr|local]      how Claude delivers each batch: one pull request per batch (default)
 screenfeed discard                 throw away unsent content
 screenfeed auto <seconds|off>      periodic sending
 screenfeed screens                 list displays (* = selected)
@@ -101,6 +102,15 @@ makes the changes, and reports back in the widget with `screenfeed say`.
 | `SCREENFEED_LANGUAGES` | `en,de`: spoken languages; anything else whisper detects is transcribed again in the last allowed one. Change at runtime with `screenfeed languages en,de` (or `auto`) |
 | `SCREENFEED_HOME` | `~/.screenfeed` |
 | `SCREENFEED_PORT` | `47811` |
+
+## Screenfeed stays out of the picture
+
+The screen is recorded with ScreenCaptureKit through a small Swift helper (`sfcapture.swift`, built with
+`xcrun swiftc` into `~/.screenfeed/bin` on first start, about 25 s). It leaves screenfeed's own widget,
+recording frame and badges out of the video, and draws the cursor. ffmpeg adds the microphone and cuts the
+chunks. If the helper cannot be built or cannot capture, screenfeed falls back to ffmpeg's AVFoundation
+capture, which records whatever is on screen; `screenfeed status` shows `capture` and `capture_problem`.
+`SCREENFEED_CAPTURE=avfoundation` forces the fallback. Needs Xcode or the Command Line Tools.
 
 ## No lost batches
 

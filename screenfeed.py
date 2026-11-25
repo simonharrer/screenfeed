@@ -25,6 +25,8 @@ Commands:
   screenfeed screen none      no screen: recording disabled (pauses a running recording)
   screenfeed send             cut the current batch and send it
   screenfeed retry <n>        process a failed batch again from the raw video it kept
+  screenfeed deliver [pr|local]   how Claude delivers each batch's changes: one pull request per
+                              batch (default) or uncommitted changes in the working tree
   screenfeed languages [x,y|auto]  show or set the spoken languages (default en,de); others are re-read
                               in the last allowed one (whisper invents foreign text on silence)
   screenfeed auto <sec|off>   send automatically every <sec> seconds
@@ -104,6 +106,13 @@ READY = HOME / "ready.jsonl"
 BATCHES = HOME / "batches"
 RAW = HOME / "raw"
 CONSUMED = RAW / "consumed_until"
+# Screen capture: "sck" (ScreenCaptureKit through the sfcapture helper, which leaves screenfeed's own widget,
+# frame and badges out of the picture) or "avfoundation" (ffmpeg alone; records whatever is on screen).
+CAPTURE = os.environ.get("SCREENFEED_CAPTURE", "sck")
+SCK_SOURCE = Path(os.path.realpath(__file__)).parent / "sfcapture.swift"
+SCK_BINARY = HOME / "bin" / "sfcapture"
+SCK = {"ready": False, "failed": None}  # failed: why the helper cannot be used (then: avfoundation)
+MAX_CAPTURE_WIDTH = 3840
 
 
 def now() -> float:
@@ -229,6 +238,37 @@ def write_consumed(t: float) -> None:
     tmp.replace(CONSUMED)
 
 
+def ensure_sck() -> None:
+    """Build the sfcapture helper when it is missing or older than its source (about 25 s, once)."""
+    if CAPTURE != "sck":
+        return
+    try:
+        if not SCK_SOURCE.exists():
+            raise RuntimeError(f"{SCK_SOURCE} missing")
+        if not SCK_BINARY.exists() or SCK_BINARY.stat().st_mtime < SCK_SOURCE.stat().st_mtime:
+            SCK_BINARY.parent.mkdir(parents=True, exist_ok=True)
+            log("sfcapture build", source=str(SCK_SOURCE))
+            r = subprocess.run(["xcrun", "swiftc", "-O", "-swift-version", "5", str(SCK_SOURCE), "-o", str(SCK_BINARY)],
+                               capture_output=True, text=True, timeout=600)
+            if r.returncode != 0:
+                raise RuntimeError(f"swiftc failed: {(r.stderr or r.stdout)[-300:]}")
+        SCK["ready"] = True
+        log("sfcapture ready", binary=str(SCK_BINARY))
+    except Exception as e:  # noqa: BLE001
+        SCK["failed"] = str(e)
+        log_exc("sfcapture unavailable, recording with avfoundation (screenfeed itself shows in the video)", e)
+
+
+def capture_size(screen: dict) -> tuple[int, int]:
+    """The display in pixels, at most MAX_CAPTURE_WIDTH wide, even sizes (H.264 needs them)."""
+    _, _, w, h = screen["frame"]
+    scale = float(screen.get("scale") or 1.0)
+    pw, ph = w * scale, h * scale
+    if pw > MAX_CAPTURE_WIDTH:
+        pw, ph = MAX_CAPTURE_WIDTH, ph * MAX_CAPTURE_WIDTH / pw
+    return int(pw) // 2 * 2, int(ph) // 2 * 2
+
+
 class Recorder:
     """One ffmpeg for one recording session: from Rec until Pause, a screen switch or a recorder failure.
 
@@ -250,6 +290,8 @@ class Recorder:
         self.screen = screen
         self.audio = audio
         self.proc: subprocess.Popen | None = None
+        self.helper: subprocess.Popen | None = None  # sfcapture, when capturing with ScreenCaptureKit
+        self.capture = "avfoundation"
         self.started_at = now()
         self.stopped_at: float | None = None
         self.origin: float | None = None  # wall-clock time of stream time 0
@@ -269,6 +311,8 @@ class Recorder:
         return r
 
     def start(self) -> None:
+        if CAPTURE == "sck" and SCK["ready"] and not SCK["failed"] and self.screen.get("id") is not None:
+            return self.start_sck()
         cmd = [
             FFMPEG, "-hide_banner", "-loglevel", "warning", "-nostats", "-y",
             # On some macOS versions AVFoundation hands out screen frames with pts 0 (and ignores
@@ -299,8 +343,58 @@ class Recorder:
         log("recorder start", rec=self.name, pid=self.proc.pid,
             screen=f"{self.screen['index']}:{self.screen.get('label', '')}", audio=self.audio)
 
+    def start_sck(self) -> None:
+        """ScreenCaptureKit: sfcapture writes raw frames into a FIFO that ffmpeg reads, without screenfeed's
+        own windows; ffmpeg adds the microphone and cuts the chunks as before."""
+        self.capture = "sck"
+        width, height = capture_size(self.screen)
+        fifo = self.dir / "screen.fifo"
+        if not fifo.exists():
+            os.mkfifo(fifo)
+        cmd = [
+            FFMPEG, "-hide_banner", "-loglevel", "warning", "-nostats", "-y",
+            "-use_wallclock_as_timestamps", "1",
+            "-f", "rawvideo", "-pix_fmt", "nv12", "-s", f"{width}x{height}", "-framerate", str(FPS),
+            "-i", str(fifo),
+        ]
+        if self.audio != "none":
+            cmd += ["-use_wallclock_as_timestamps", "1", "-f", "avfoundation", "-i", f":{self.audio}",
+                    "-map", "0:v", "-map", "1:a"]
+        cmd += ["-vf", f"fps={FPS}", "-c:v", "h264_videotoolbox", "-b:v", "5M", "-g", str(FPS * CHUNK_SECONDS)]
+        if self.audio != "none":
+            cmd += ["-c:a", "aac", "-b:a", "96k", "-ac", "1"]
+        cmd += [
+            "-f", "segment", "-segment_time", str(CHUNK_SECONDS), "-segment_format", "matroska",
+            "-reset_timestamps", "1", "-segment_list", str(self.dir / "chunks.csv"),
+            "-segment_list_type", "csv", "-segment_list_flags", "+live",
+            str(self.dir / "chunk-%05d.mkv"),
+            "-progress", str(self.dir / "progress.txt"), "-stats_period", "1",
+        ]
+        self.started_at = self.grew_at = now()
+        # ffmpeg first: opening the FIFO for writing waits until a reader has it open.
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                     stderr=(self.dir / "ffmpeg.log").open("w"))
+        self.helper = subprocess.Popen(
+            [str(SCK_BINARY), "--display", str(self.screen["id"]), "--width", str(width), "--height", str(height),
+             "--fps", str(FPS), "--exclude-pid", str(os.getpid()), "--out", str(fifo)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=(self.dir / "sfcapture.log").open("w"))
+        log("recorder start", rec=self.name, pid=self.proc.pid, helper=self.helper.pid, capture="sck",
+            size=f"{width}x{height}", screen=f"{self.screen['id']}:{self.screen.get('label', '')}", audio=self.audio)
+
     def alive(self) -> bool:
+        if self.helper is not None and self.helper.poll() is not None:
+            if self.helper.returncode != 0 and not SCK["failed"]:
+                # cannot capture (e.g. no permission): every later recorder falls back to avfoundation
+                SCK["failed"] = self.helper_tail() or f"sfcapture exited with {self.helper.returncode}"
+                log("sfcapture failed, falling back to avfoundation", rec=self.name, error=SCK["failed"])
+            return False
         return bool(self.proc and self.proc.poll() is None)
+
+    def helper_tail(self) -> str:
+        try:
+            return " | ".join((self.dir / "sfcapture.log").read_text(errors="replace").strip().splitlines()[-2:])
+        except OSError:
+            return ""
 
     def chunks(self, partial: bool = False) -> list[dict]:
         """Chunks still on disk, oldest first, as {path, start, end} in wall-clock time. Finished chunks
@@ -375,6 +469,14 @@ class Recorder:
         """Stop ffmpeg: q (finishes the current chunk), then SIGTERM, then SIGKILL. Never raises: at worst
         the chunk being written (CHUNK_SECONDS) is lost; everything before it is on disk already."""
         self.stopped_at = self.stopped_at or now()
+        h = self.helper
+        if h is not None and h.poll() is None:
+            # Without new frames ffmpeg finishes the video at once; q below then ends the microphone.
+            h.terminate()
+            try:
+                h.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                h.kill()
         p = self.proc
         if not p or p.poll() is not None:
             log("recorder stop: already ended", rec=self.name, exit=p.returncode if p else None)
@@ -447,6 +549,7 @@ class Controller:
         self.status = "Ready"
         self.claude_msg = ""
         self.claude_msg_at: float | None = None
+        self.ui_tick_at: float | None = None  # the widget's last refresh: a frozen widget shows here
         self.last_batch: dict | None = None
         self.history: deque = deque(maxlen=20)  # newest first: sent batches and their fate
         self.busy = 0
@@ -868,7 +971,12 @@ class Controller:
             "last_batch": self.last_batch,
             "build": BUILD,
             "log": str(LOG),
+            "ui_tick_age": round(now() - self.ui_tick_at, 1) if self.ui_tick_at else None,
             "languages": languages() or "auto",
+            "deliver": deliver_mode(),
+            "capture": (self.rec.capture if self.rec else
+                        ("sck" if CAPTURE == "sck" and SCK["ready"] and not SCK["failed"] else "avfoundation")),
+            "capture_problem": SCK["failed"],
             "history": [dict(h, sent_at=time.strftime("%H:%M:%S", time.localtime(h["sent_at"])),
                              sent_ago=fmt_ago(h["sent_at"]))
                         for h in self.history],
@@ -989,6 +1097,26 @@ def languages() -> list[str]:
         value = LANG if LANG != "auto" else DEFAULT_LANGUAGES
     value = str(value).strip().lower()
     return [] if value in ("", "auto", "any") else [x.strip() for x in value.split(",") if x.strip()]
+
+
+def deliver_mode() -> str:
+    """How Claude delivers the changes for a batch: "pr" (default: one branch and pull request per batch)
+    or "local" (changes stay uncommitted in the working tree). Set with `screenfeed deliver`."""
+    try:
+        value = json.loads(CONFIG.read_text()).get("deliver")
+    except (OSError, ValueError):
+        value = None
+    return value if value in ("pr", "local") else os.environ.get("SCREENFEED_DELIVER", "pr")
+
+
+def set_config(key: str, value: str) -> None:
+    HOME.mkdir(parents=True, exist_ok=True)
+    try:
+        cfg = json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        cfg = {}
+    cfg[key] = value
+    CONFIG.write_text(json.dumps(cfg))
 
 
 def run_whisper(wav: Path, out: Path, lang: str) -> dict:
@@ -1286,6 +1414,7 @@ def run_app() -> None:
     threading.excepthook = _log_uncaught
     leftovers = sorted(p.name for p in RAW.glob("*")) if RAW.exists() else []
     log("app starting", pid=os.getpid(), leftover_raw=",".join(leftovers) or "none")
+    threading.Thread(target=ensure_sck, daemon=True, name="sfcapture-build").start()
     ctl = Controller()  # recovers what an earlier run left in RAW; never wipe it here
 
     def screen_info(s) -> dict:
@@ -1296,6 +1425,7 @@ def run_app() -> None:
         name = str(s.localizedName())
         return {"id": did, "index": ids.index(did) if did in ids else 0,
                 "frame": (f.origin.x, f.origin.y, f.size.width, f.size.height),
+                "scale": float(s.backingScaleFactor()),
                 "name": name, "label": name, "size": f"{int(f.size.width)}×{int(f.size.height)}"}
 
     def all_screens() -> list[dict]:
@@ -1598,6 +1728,8 @@ def run_app() -> None:
             self.quit_armed = 0.0
             self.n = 0
             self.acting = None  # (button, title) while a clicked action runs: shown at once
+            self.hist_cache: dict = {}  # what each history row shows, to redraw only on change
+            self.tick_error_logged = 0.0
             self.fast_until = 0.0  # refresh at full rate until then (right after a click)
             self.slow_logged = 0.0
             p.orderFrontRegardless()
@@ -1684,6 +1816,18 @@ def run_app() -> None:
                 self.autopick.selectItemAtIndex_(j)
 
         def tick_(self, timer):
+            """The widget's heartbeat (30 Hz). An exception escaping an NSTimer callback stops the timer for
+            good, without a word: the widget would freeze while clicks still start and stop recording."""
+            ctl.ui_tick_at = now()
+            try:
+                self.refresh()
+            except Exception as e:  # noqa: BLE001
+                if now() - self.tick_error_logged > 10:
+                    self.tick_error_logged = now()
+                    log_exc("ui refresh failed (widget keeps running)", e)
+
+        @objc.python_method
+        def refresh(self):
             t = now()
             f = self.panel.frame()
             ctl.widget_frame = (f.origin.x, f.origin.y, f.size.width, f.size.height)
@@ -1768,7 +1912,7 @@ def run_app() -> None:
             for i, (ic, lab) in enumerate(zip(self.hist_icons, self.hist)):
                 if i >= len(hist):
                     ic.setHidden_(True)
-                    lab.sf_text = None
+                    self.hist_cache.pop((i, "text"), None)
                     lab.setStringValue_("Nothing sent yet" if i == 0 else "")
                     lab.setFrameOrigin_(K.NSMakePoint(12 if i == 0 else 30, lab.frame().origin.y))
                     continue
@@ -1784,8 +1928,9 @@ def run_app() -> None:
                     sym, tint, what = "exclamationmark.triangle.fill", K.NSColor.systemYellowColor(), "failed"
                 ic.setHidden_(False)
                 lab.setFrameOrigin_(K.NSMakePoint(30, lab.frame().origin.y))
-                if getattr(ic, "sf_sym", None) != sym:  # building symbol images on every refresh is slow
-                    ic.sf_sym = sym
+                # caches live on self: AppKit's own views do not take Python attributes
+                if self.hist_cache.get((i, "sym")) != sym:  # building symbol images on every refresh is slow
+                    self.hist_cache[(i, "sym")] = sym
                     ic.setImage_(symbol(sym, 11))
                     ic.setContentTintColor_(tint)
                 # columns on tab stops: when (right-aligned), batch number, length, outcome
@@ -1798,8 +1943,8 @@ def run_app() -> None:
                     self.hist_style.setLineBreakMode_(K.NSLineBreakByTruncatingTail)
                 text = (f"\t{fmt_ago(h['sent_at'])}\t#{h['batch']}\t{fmt_dur(h['seconds'])}\t{what}"
                         + (" · auto" if h["auto"] else ""))
-                if getattr(lab, "sf_text", None) != text:
-                    lab.sf_text = text
+                if self.hist_cache.get((i, "text")) != text:
+                    self.hist_cache[(i, "text")] = text
                     lab.setAttributedStringValue_(K.NSAttributedString.alloc().initWithString_attributes_(text, {
                         K.NSFontAttributeName: lab.font(), K.NSForegroundColorAttributeName: lab.textColor(),
                         K.NSParagraphStyleAttributeName: self.hist_style}))
@@ -1936,10 +2081,25 @@ def cmd_launch() -> None:
                      stdin=subprocess.DEVNULL, start_new_session=True)
     for _ in range(100):
         if running():
-            print(f"screenfeed running (log: {HOME / 'app.log'})")
+            break
+        time.sleep(0.2)
+    else:
+        sys.exit(f"screenfeed did not come up, see {HOME / 'app.log'}")
+    for _ in range(25):  # the widget refreshes 30 times a second once it is up
+        age = ui_tick_age()
+        if age is not None and age < 2:
+            print(f"screenfeed running (log: {HOME / 'app.log'}, actions: {LOG})")
             return
         time.sleep(0.2)
-    sys.exit(f"screenfeed did not come up, see {HOME / 'app.log'}")
+    sys.exit(f"screenfeed is up but its widget does not refresh, see {LOG} and {HOME / 'app.log'}")
+
+
+def ui_tick_age() -> float | None:
+    """Seconds since the widget last refreshed, None if unknown."""
+    try:
+        return api("GET", "/status", timeout=3).get("ui_tick_age")
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def cmd_watch() -> None:
@@ -1948,7 +2108,7 @@ def cmd_watch() -> None:
     HOME.mkdir(parents=True, exist_ok=True)
     READY.touch()
     seen = int(cursor.read_text() or 0) if cursor.exists() else len(READY.read_text().splitlines())
-    alive, last_check = running(), 0.0
+    alive, last_check, frozen = running(), 0.0, False
     print(f"SCREENFEED watching (app {'running' if alive else 'NOT running'})", flush=True)
     while True:
         lines = READY.read_text().splitlines()
@@ -1966,12 +2126,22 @@ def cmd_watch() -> None:
             seen = len(lines)
             cursor.write_text(str(seen))
         if time.time() - last_check > 5:
+            # The Mac slept if this loop itself stood still: the widget did not refresh then either.
+            slept = time.time() - last_check > 15 and last_check > 0
             last_check = time.time()
             ok = running()
             if alive and not ok:
                 print("SCREENFEED app stopped running (watch exits)", flush=True)
                 return
             alive = ok
+            age = ui_tick_age() if ok else None
+            if slept:
+                age = None
+            if age is not None and age > 10 and not frozen:
+                frozen = True  # the widget stopped refreshing: clicks may go unseen
+                print(f"SCREENFEED ERROR widget not refreshing for {age:.0f}s (see {LOG})", flush=True)
+            elif age is not None and age < 2:
+                frozen = False
         time.sleep(0.5)
 
 
@@ -1992,14 +2162,15 @@ def main(argv: list[str]) -> None:
                 value = argv[2].strip().lower()
                 if value not in ("auto", "any") and not re.fullmatch(r"[a-z]{2,3}(,[a-z]{2,3})*", value.replace(" ", "")):
                     sys.exit("usage: screenfeed languages <codes, e.g. en,de | auto>")
-                HOME.mkdir(parents=True, exist_ok=True)
-                try:
-                    cfg = json.loads(CONFIG.read_text())
-                except (OSError, ValueError):
-                    cfg = {}
-                cfg["languages"] = value.replace(" ", "")
-                CONFIG.write_text(json.dumps(cfg))
+                set_config("languages", value.replace(" ", ""))
             print(",".join(languages()) or "auto (any language)")
+            return
+        elif cmd == "deliver":
+            if len(argv) > 2:
+                if argv[2] not in ("pr", "local"):
+                    sys.exit("usage: screenfeed deliver <pr|local>")
+                set_config("deliver", argv[2])
+            print(deliver_mode())
             return
         elif cmd == "retry":
             if len(argv) < 3 or not argv[2].isdigit():
