@@ -85,6 +85,24 @@ Never test with `say` or other audio playback; the user may be in a call. Only r
      ("Batch n: question in terminal").
    - If the app needs a reload/rebuild to show the change, do it (or tell the user) so the next batch shows the new state.
 4. Batches arrive while you work; handle them in order. A later batch can correct an earlier one; the newest wins.
+5. **New PR per batch: one forked agent per batch.** Only in the `pr` mode (each batch's `Deliver:` line), and
+   only when the Agent tool can fork (`subagent_type: "fork"`): batches then share no branch, so they run in
+   parallel. On each batch event, after `screenfeed say "Batch n: reading"`, fork one agent for that batch and
+   go back to waiting; do not work on the batch yourself. Its prompt names the batch (`timeline.md` path,
+   number) and these rules:
+   - Its own git worktree from the default branch (`git worktree add -b screenfeed/batch-<n>-<slug>
+     ../<repo>-b<n> origin/<default branch>`), never the main checkout, so forks do not switch each other's
+     branches. Remove the worktree when the PR is open.
+   - Its own port for the local app (e.g. 8140 + n), and stop that app (kill by port) when done. A fresh
+     worktree may need what is not in git: copy ignored binaries from the main checkout when they fail
+     (entropy-data: `tailwindcss`, whose download can come with a broken signature, so macOS kills it).
+   - Everything else as in step 3: read the batch, change, test, commit, push, PR with before/after
+     screenshots, `screenfeed say "Batch n: PR #… …"`. A batch that only needs a question: it reports the
+     question back instead of guessing.
+   - It reports back the PR link, what changed and the tests, or the question; you relay that in chat.
+   A batch that corrects an earlier one whose fork is still running: wait for that fork, then give the
+   correction to its branch (send it to that agent, or fork a new one on the same branch). In the `main` and
+   `branch` modes, batches share one branch: handle them yourself, in order, as in step 3.
 
 ## Notes
 
