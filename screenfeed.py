@@ -27,6 +27,9 @@ Commands:
   screenfeed retry <n>        process a failed batch again from the raw video it kept
   screenfeed deliver [pr | main | branch <name or #PR>]   where Claude puts each batch's changes: a new
                               pull request per batch from main (default), commits on main, or one branch/PR
+  screenfeed workdir [path]   show or set the repository whose pull requests and branches the Deliver picker
+                              suggests (launch and watch remember the git repository they run in)
+  screenfeed note [on|off|toggle]  show or hide the note on the recorded screen (the frame stays)
   screenfeed languages [x,y|auto]  show or set the spoken languages (default en,de); others are re-read
                               in the last allowed one (whisper invents foreign text on silence)
   screenfeed auto <sec|off>   send automatically every <sec> seconds
@@ -1011,6 +1014,8 @@ class Controller:
             "languages": languages() or "auto",
             "deliver": deliver_mode(),
             "deliver_label": deliver_label(deliver_mode()),
+            "workdir": config_value("workdir"),
+            "overlay_note": overlay_note_shown(),
             "capture": (self.rec.capture if self.rec else
                         ("sck" if CAPTURE == "sck" and SCK["ready"] and not SCK["failed"] else "avfoundation")),
             "capture_problem": SCK["failed"],
@@ -1159,7 +1164,83 @@ def deliver_label(d: dict) -> str:
     return {"pr": "New PR per batch", "main": "Commit to main"}.get(d["mode"]) or f"Branch / PR: {d.get('target')}"
 
 
-def set_config(key: str, value: str) -> None:
+def config_value(key: str, default=None):
+    try:
+        return json.loads(CONFIG.read_text()).get(key, default)
+    except (OSError, ValueError):
+        return default
+
+
+def overlay_note_shown() -> bool:
+    """Whether the recorded display shows its note ("Ready …", "● REC …", "Not recorded" on the others).
+    The coloured frame stays either way. Toggled with the eye in the widget or `screenfeed note on|off`."""
+    return bool(config_value("overlay_note", True))
+
+
+def remember_workdir() -> None:
+    """Remember the git repository Claude runs screenfeed from, for the Deliver picker's suggestions."""
+    try:
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+                             timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        top = ""
+    if top and top != config_value("workdir"):
+        set_config("workdir", top)
+        log("workdir", path=top)
+
+
+SUGGESTIONS: dict = {"repo": None, "at": 0.0, "items": [], "busy": False}
+
+
+def branch_suggestions(repo: str) -> list[tuple[str, str]]:
+    """(value, label) pairs for the Deliver dialog: the repository's open pull requests (newest first),
+    then local branches by last commit, without the default branch and branches that have a pull request."""
+    def run(cmd: list[str]) -> str:
+        try:
+            r = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=8)
+            return r.stdout if r.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    items, heads = [], set()
+    try:
+        prs = json.loads(run(["gh", "pr", "list", "--limit", "15", "--json", "number,title,headRefName"]) or "[]")
+    except ValueError:
+        prs = []
+    for pr in prs:
+        heads.add(pr["headRefName"])
+        items.append((f"#{pr['number']}", f"#{pr['number']}  {pr['title']}  ({pr['headRefName']})"))
+    default = run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).strip().removeprefix("origin/")
+    for b in run(["git", "for-each-ref", "--sort=-committerdate", "--count=15", "--format=%(refname:short)",
+                  "refs/heads"]).split():
+        if b not in heads and b not in (default, "main", "master"):
+            items.append((b, b))
+    return items
+
+
+def refresh_suggestions(wait: bool = False) -> None:
+    """Fetch the suggestions for the remembered repository in the background (at most once a minute)."""
+    repo = config_value("workdir")
+    if not repo or SUGGESTIONS["busy"]:
+        return
+    if SUGGESTIONS["repo"] == repo and now() - SUGGESTIONS["at"] < 60:
+        return
+    SUGGESTIONS["busy"] = True
+
+    def work():
+        try:
+            items = branch_suggestions(repo)
+            SUGGESTIONS.update(repo=repo, at=now(), items=items)
+        finally:
+            SUGGESTIONS["busy"] = False
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    if wait:
+        t.join(10)
+
+
+def set_config(key: str, value) -> None:
     HOME.mkdir(parents=True, exist_ok=True)
     try:
         cfg = json.loads(CONFIG.read_text())
@@ -1572,6 +1653,10 @@ def run_app() -> None:
             root.addSubview_(border)
         else:
             text, bg, size = "Not recorded", K.NSColor.colorWithWhite_alpha_(0.25, 0.85), 12
+        if not overlay_note_shown():  # the frame alone; "off" screens get no window at all
+            w.setContentView_(root)
+            w.orderFrontRegardless()
+            return w
         lbl = K.NSTextField.labelWithString_(text)
         lbl.setFont_(K.NSFont.boldSystemFontOfSize_(size))
         lbl.setTextColor_(K.NSColor.whiteColor())
@@ -1605,14 +1690,15 @@ def run_app() -> None:
             f = s.frame()
             return (f.origin.x, f.origin.y, f.size.width, f.size.height)
 
-        key = (tuple(fr(s) for s in screens), tuple(target["frame"]), mode) if target else None
+        note = overlay_note_shown()
+        key = (tuple(fr(s) for s in screens), tuple(target["frame"]), mode, note) if target else None
         if key == overlays["key"]:
             return
         for w in overlays["wins"]:
             w.orderOut_(None)
         overlays["wins"], overlays["key"] = [], key
         if key:
-            others = mode in ("rec", "flash")  # "Not recorded" badges only when it matters
+            others = note and mode in ("rec", "flash")  # "Not recorded" badges only when it matters
             overlays["wins"] = [make_overlay(s, mode) if fr(s) == tuple(target["frame"])
                                 else make_overlay(s, "off") for s in screens
                                 if others or fr(s) == tuple(target["frame"])]
@@ -1790,7 +1876,7 @@ def run_app() -> None:
 
             # where Claude puts the changes of a batch
             icon(R(12, 120, 18, 18), "arrow.triangle.branch", 13, secondary)
-            self.deliverpick = K.NSPopUpButton.alloc().initWithFrame_pullsDown_(R(30, 116, W - 42, 26), False)
+            self.deliverpick = K.NSPopUpButton.alloc().initWithFrame_pullsDown_(R(30, 116, W - 70, 26), False)
             self.deliverpick.setBordered_(False)
             self.deliverpick.setFont_(K.NSFont.systemFontOfSize_(12))
             self.deliverpick.setTarget_(self)
@@ -1798,6 +1884,10 @@ def run_app() -> None:
             self.deliverpick.setToolTip_("Where Claude puts the changes of each batch")
             v.addSubview_(self.deliverpick)
             self.deliver_items = []
+            # show / hide the note on the recorded screen ("Ready …", "● REC …"); the frame stays
+            self.notebtn = icon_button(R(W - 12 - 24, 119, 24, 20), "eye", 13, secondary, "onNote:",
+                                       "Show or hide the note on the recorded screen (the frame stays)")
+            self.note_shown = None
 
             separator(150)
             self.stat = label(R(12, 158, W - 24, 15), 11, secondary)
@@ -1906,26 +1996,61 @@ def run_app() -> None:
             log("ui deliver", mode=choice)
             self.deliver_key = None
 
+        def onNote_(self, sender):
+            shown = not overlay_note_shown()
+            set_config("overlay_note", shown)
+            log("ui note", shown=shown)
+
+        @objc.python_method
+        def syncNote(self):
+            shown = overlay_note_shown()
+            if shown == self.note_shown:
+                return
+            self.note_shown = shown
+            self.notebtn.setImage_(symbol("eye" if shown else "eye.slash", 13))
+            self.notebtn.setToolTip_("Hide the note on the recorded screen (the frame stays)" if shown
+                                     else "Show the note on the recorded screen")
+
         @objc.python_method
         def askBranch(self) -> str | None:
-            """A small dialog for the branch name or pull request number (#123)."""
+            """A small dialog for the branch name or pull request number (#123), with the open pull
+            requests and recent branches of the repository Claude runs in as suggestions."""
+            refresh_suggestions()
+            deadline = now() + 8
+            while SUGGESTIONS["busy"] and now() < deadline:  # first fetch: wait briefly, it is a modal dialog anyway
+                time.sleep(0.1)
+            repo = config_value("workdir")
+            items = SUGGESTIONS["items"] if SUGGESTIONS["repo"] == repo else []
             K.NSApp.activateIgnoringOtherApps_(True)
             alert = K.NSAlert.alloc().init()
             alert.setMessageText_("Deliver to a branch or pull request")
-            alert.setInformativeText_("Every batch goes onto this branch, in the repository of the app you show. "
-                                      "A pull request number like #123 means its branch.")
-            field = K.NSTextField.alloc().initWithFrame_(K.NSMakeRect(0, 0, 260, 24))
+            alert.setInformativeText_(
+                "Every batch goes onto this branch, in the repository of the app you show. "
+                "A pull request number like #123 means its branch."
+                + (f"\n\nSuggestions from {os.path.basename(repo)}: open pull requests, then recent branches."
+                   if items else ""))
+            field = K.NSComboBox.alloc().initWithFrame_(K.NSMakeRect(0, 0, 420, 26))
             field.setPlaceholderString_("feature/my-branch or #123")
+            field.setCompletes_(True)
+            field.setNumberOfVisibleItems_(12)
+            labels = [label for _, label in items]
+            if labels:
+                field.addItemsWithObjectValues_(labels)
             current = deliver_mode()
             if current.get("target"):
-                field.setStringValue_(current["target"])
+                field.setStringValue_(next((l for v, l in items if v == current["target"]), current["target"]))
             alert.setAccessoryView_(field)
             alert.addButtonWithTitle_("Use")
             alert.addButtonWithTitle_("Cancel")
             alert.window().setInitialFirstResponder_(field)
             if alert.runModal() != K.NSAlertFirstButtonReturn:
                 return None
-            return str(field.stringValue()).strip() or None
+            text = str(field.stringValue()).strip()
+            value = next((v for v, l in items if l == text), None)  # a picked suggestion
+            if value is None:
+                m = re.match(r"#(\d+)\b", text)  # "#123 …" typed or edited by hand
+                value = f"#{m.group(1)}" if m else text
+            return value or None
 
         @objc.python_method
         def syncDeliver(self):
@@ -2038,6 +2163,9 @@ def run_app() -> None:
             sync_overlays(self.panel)
             self.syncPicker()
             self.syncDeliver()
+            self.syncNote()
+            if self.n % 900 == 0:  # every 30 s; fetches at most once a minute, in the background
+                refresh_suggestions()
             if getattr(self, "edge_rec", None) != rec:
                 self.edge_rec = rec
                 self.edge.layer().setBorderWidth_(2 if rec else 0.5)
@@ -2362,6 +2490,8 @@ def main(argv: list[str]) -> None:
     try:
         if cmd == "app":
             return run_app()
+        if cmd in ("launch", "watch"):  # run by Claude from the repository it works in
+            remember_workdir()
         if cmd == "launch":
             return cmd_launch()
         if cmd == "watch":
@@ -2387,6 +2517,22 @@ def main(argv: list[str]) -> None:
                 else:
                     sys.exit("usage: screenfeed deliver pr | main | branch <branch or #PR>")
             print(deliver_label(deliver_mode()))
+            return
+        elif cmd == "note":
+            arg = argv[2] if len(argv) > 2 else ""
+            if arg in ("on", "off", "toggle"):
+                set_config("overlay_note", (not overlay_note_shown()) if arg == "toggle" else arg == "on")
+            elif arg:
+                sys.exit("usage: screenfeed note [on | off | toggle]")
+            print("note shown" if overlay_note_shown() else "note hidden (the frame stays)")
+            return
+        elif cmd == "workdir":
+            if len(argv) > 2:
+                path = os.path.abspath(os.path.expanduser(argv[2]))
+                if not os.path.isdir(path):
+                    sys.exit(f"not a directory: {path}")
+                set_config("workdir", path)
+            print(config_value("workdir") or "not set (screenfeed launch / watch remember the git repository they run in)")
             return
         elif cmd == "retry":
             if len(argv) < 3 or not argv[2].isdigit():

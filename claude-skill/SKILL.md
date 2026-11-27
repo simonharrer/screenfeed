@@ -25,6 +25,10 @@ screenfeed send              # cut and send the current batch now
 screenfeed retry <n>         # process a failed batch again from the raw video it kept
 screenfeed deliver [pr | main | branch <name or #PR>]  # where batches go: new PR each (default), main, one branch/PR
 screenfeed languages [en,de|auto]  # spoken languages (default en,de); others are re-read in the last allowed one
+screenfeed workdir [path]    # repo whose open PRs and branches the Deliver dialog suggests; launch/watch
+                             #   remember the git repo they run in, so run them from the app's repo
+screenfeed note on | off     # show/hide the note on the recorded screen (also the eye in the widget);
+                             #   the coloured frame stays
 screenfeed auto 60 | off     # periodic sending
 screenfeed say "text"        # show a short status line from Claude in the widget
 screenfeed status            # JSON state
