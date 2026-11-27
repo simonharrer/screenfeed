@@ -93,6 +93,12 @@ Never test with `say` or other audio playback; the user may be in a call. Only r
      video calls, notifications, personal data, colleagues' names) goes into a PR. Store them on the
      repository's `pr-screenshots` branch (image only, no history with main) and link them in the PR
      description as `https://github.com/<owner>/<repo>/blob/pr-screenshots/pr-<n>/before.png?raw=true`.
+     **Database migrations** (every mode): a change that adds or edits a database migration (e.g. a Flyway
+     `V*.sql`) gets a warning note at the very top of the PR description, so it is not overlooked:
+     `> [!WARNING]` followed by `> **Database migration:** <file>: <what it does, e.g. adds column x to table y>`
+     and whether it is additive and rollout-safe. With several batches on one PR, the note stays at the top.
+     In the `main` mode, say it first in chat. A fork reports it back, and the chat summary and widget note
+     mention it (`screenfeed say "Batch n: PR #123 (DB migration) ..."`).
      A batch with nothing to change (no speech, only clicking) gets no commit and no PR.
    - `screenfeed say "Batch n: <what changed, max ~60 chars>"` so the user sees it on screen,
      and give a short summary in chat. If a remark is ambiguous, ask in chat and say so in the widget
